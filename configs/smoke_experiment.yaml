@@ -1,0 +1,8 @@
+project: Sheaf Neural Operators for MHD smoke test
+models: [unet, fno, sheaf_mhd]
+seeds: [0]
+smoke_overrides:
+  epochs: 1
+  max_train_samples: 4
+  max_valid_samples: 2
+  max_test_samples: 2
