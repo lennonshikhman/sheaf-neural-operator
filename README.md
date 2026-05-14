@@ -41,7 +41,7 @@ x: [C_in, X, Y, Z]
 y: [C_out, X, Y, Z]
 ```
 
-If magnetic channel indices are provided in the config, divergence diagnostics are computed. If metadata are uncertain, the first implementation uses direct magnetic prediction on The Well while still reporting available diagnostics.
+If magnetic channel indices are provided in the config, divergence diagnostics are computed and the 3D Sheaf Neural Operator can use a vector-potential curl head for divergence-controlled magnetic updates. If channel metadata are unavailable, the configuration intentionally leaves the indices unset rather than guessing physical channels.
 
 ### Orszag-Tang FARGO3D processed dataset
 
@@ -96,7 +96,7 @@ The default suite covers both datasets, three models (`unet`, `fno`, `sheaf_mhd`
 
 ### Sheaf Neural Operator
 
-`SheafMHDOperator` separates fluid and magnetic fibers, updates each fiber with local neural operators, exchanges information through learned sheaf-style restriction maps, and optionally augments features with incidence-inspired divergence information.
+`SheafMHDOperator` separates fluid and magnetic fibers, updates each fiber with local CNN or FNO operators, exchanges information through learned sheaf-style restriction maps, and augments magnetic runs with incidence-inspired divergence information when magnetic channels are known.
 
 For 2D Orszag-Tang, the magnetic head predicts a scalar EMF-like potential `a(y,z)` and applies:
 
@@ -170,5 +170,5 @@ Aggregation over seeds includes mean, standard deviation, standard error, 95% t-
 
 - The Well `MHD_64` is a uniform-grid benchmark, so it tests structure preservation and 3D scalability more than arbitrary cell-complex generality.
 - Orszag-Tang is 2D and uses a simplified field set.
-- This first implementation approximates sheaf/cell-complex structure on structured grids; a later unstructured-mesh version should use explicit cells, faces, edges, and incidence matrices.
-- The 2D Orszag-Tang magnetic update is the strongest exact-constraint component; 3D The Well currently emphasizes diagnostics and divergence-aware losses unless reliable magnetic channel metadata are supplied.
+- This implementation builds the sheaf/cell-complex structure on structured grids. Unstructured-mesh experiments would require explicit mesh cells, faces, edges, and incidence matrices supplied by the dataset.
+- The 2D Orszag-Tang magnetic update is the most directly constrained path because the field set contains exactly the two magnetic components needed by the scalar EMF update. The 3D vector-potential curl head is available when reliable magnetic channel indices are supplied for The Well.
