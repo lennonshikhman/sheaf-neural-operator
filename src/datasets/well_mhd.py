@@ -73,7 +73,7 @@ class WellMHD64Dataset(Dataset):
         if isinstance(item, torch.Tensor):
             return item.float()
         if isinstance(item, dict):
-            for key in ("x", "input", "data", "fields", "u", "trajectory"):
+            for key in ("x", "input", "input_fields", "data", "fields", "u", "trajectory"):
                 if key in item and torch.is_tensor(item[key]):
                     return item[key].float()
             tensors = [v for v in item.values() if torch.is_tensor(v)]
@@ -84,6 +84,30 @@ class WellMHD64Dataset(Dataset):
             if tensors:
                 return tensors[0].float()
         raise TypeError(f"Could not find tensor in WellDataset item of type {type(item)}")
+
+    def _extract_xy_tensors(self, item: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return supervised input/target tensors when The Well yields pairs.
+
+        Some ``the_well`` versions return a full trajectory, while others return
+        adjacent supervised examples with one input frame and one output frame.
+        The old adapter only consumed the first tensor, which made paired samples
+        look like a one-frame trajectory and raised ``needs 2``.
+        """
+        if isinstance(item, dict):
+            x_keys = ("x", "input", "inputs", "input_fields")
+            y_keys = ("y", "target", "targets", "output", "outputs", "output_fields", "label", "labels")
+            x = next((item[key] for key in x_keys if key in item and torch.is_tensor(item[key])), None)
+            y = next((item[key] for key in y_keys if key in item and torch.is_tensor(item[key])), None)
+            if x is not None and y is not None:
+                return x.float(), y.float()
+            tensors = [value for value in item.values() if torch.is_tensor(value)]
+            if len(tensors) >= 2:
+                return tensors[0].float(), tensors[1].float()
+        if isinstance(item, (tuple, list)):
+            tensors = [value for value in item if torch.is_tensor(value)]
+            if len(tensors) >= 2:
+                return tensors[0].float(), tensors[1].float()
+        return None
 
     def _to_time_channel_grid(self, u: torch.Tensor) -> torch.Tensor:
         # Accept common layouts [T,C,X,Y,Z], [T,X,Y,Z,C], [C,T,X,Y,Z], [X,Y,Z,C], [C,X,Y,Z].
@@ -112,9 +136,20 @@ class WellMHD64Dataset(Dataset):
 
     def __getitem__(self, idx: int):
         raw = self.ds[idx]
-        u = self._to_time_channel_grid(self._extract_tensor(raw))
-        if u.shape[0] < self.n_input_frames + self.n_output_frames:
-            raise ValueError(f"Well sample has {u.shape[0]} frames but needs {self.n_input_frames + self.n_output_frames}")
-        x = u[: self.n_input_frames].reshape(-1, *u.shape[2:])
-        y = u[self.n_input_frames : self.n_input_frames + self.n_output_frames].reshape(-1, *u.shape[2:])
+        paired = self._extract_xy_tensors(raw)
+        if paired is not None:
+            x_u = self._to_time_channel_grid(paired[0])
+            y_u = self._to_time_channel_grid(paired[1])
+            if x_u.shape[0] < self.n_input_frames:
+                raise ValueError(f"Well input sample has {x_u.shape[0]} frames but needs {self.n_input_frames}")
+            if y_u.shape[0] < self.n_output_frames:
+                raise ValueError(f"Well target sample has {y_u.shape[0]} frames but needs {self.n_output_frames}")
+            x = x_u[: self.n_input_frames].reshape(-1, *x_u.shape[2:])
+            y = y_u[: self.n_output_frames].reshape(-1, *y_u.shape[2:])
+        else:
+            u = self._to_time_channel_grid(self._extract_tensor(raw))
+            if u.shape[0] < self.n_input_frames + self.n_output_frames:
+                raise ValueError(f"Well sample has {u.shape[0]} frames but needs {self.n_input_frames + self.n_output_frames}")
+            x = u[: self.n_input_frames].reshape(-1, *u.shape[2:])
+            y = u[self.n_input_frames : self.n_input_frames + self.n_output_frames].reshape(-1, *u.shape[2:])
         return {"x": x, "y": y, "meta": {"split": self.split, "magnetic_field_indices": self.magnetic_field_indices}}
