@@ -26,6 +26,7 @@ datasets:
     constrained_magnetic_update: vector_potential
     lambda_rel: 0.1
     lambda_div: 0.001
+    max_internal_cells: 32768
     max_train_samples: null
     max_valid_samples: null
     max_test_samples: null
@@ -64,6 +65,7 @@ datasets:
     constrained_magnetic_update: direct_with_divergence_features
     lambda_rel: 0.1
     lambda_div: 0.001
+    max_internal_cells: 32768
     max_train_samples: null
     max_valid_samples: null
     max_test_samples: null
@@ -120,5 +122,6 @@ training:
     unet3d: true
     fno3d: false
     sheaf_mhd: false
+    cellular_mhd_sno: false
     mlp: true
     sheaf_equilibrium: false
