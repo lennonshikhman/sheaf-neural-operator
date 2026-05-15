@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import gc
 import json
 import os
 import time
@@ -74,7 +75,7 @@ def select_output_root() -> tuple[Path, bool]:
     if not force_new and outputs.exists():
         candidates = sorted(
             (path for path in outputs.glob(f"{prefix}*") if path.is_dir()),
-            key=lambda path: path.stat().st_mtime,
+            key=lambda path: (path.stat().st_mtime, path.name),
             reverse=True,
         )
         if candidates:
@@ -369,6 +370,14 @@ def make_loaders(datasets: dict[str, Any], batch_size: int, loader_cfg: dict[str
     }
     if num_workers > 0:
         kwargs["prefetch_factor"] = int(loader_cfg.get("prefetch_factor", 2))
+        # The final protocol creates fresh DataLoader workers for every seed.
+        # On Linux, PyTorch's default worker start method is ``fork``. Forking a
+        # new worker pool after the previous seed has initialized CUDA (and, for
+        # UNet, torch.compile's CUDA graphs) can inherit poisoned CUDA/pinned-
+        # memory state and hang partway through the next epoch. Use a clean
+        # interpreter for CUDA runs unless the config explicitly overrides it.
+        if device.type == "cuda":
+            kwargs["multiprocessing_context"] = loader_cfg.get("multiprocessing_context", "spawn")
     return {split: DataLoader(ds, shuffle=(split == "train"), **kwargs) for split, ds in datasets.items()}
 
 
@@ -391,6 +400,20 @@ def shutdown_loaders(loaders: dict[str, DataLoader] | None) -> None:
             shutdown()
         if hasattr(loader, "_iterator"):
             loader._iterator = None
+
+
+def cleanup_after_run(model: Any | None = None) -> None:
+    """Release per-seed Python/CUDA state before constructing the next seed.
+
+    This is intentionally conservative because the suite may run many compiled
+    models in one Python process. Deleting the last model reference and emptying
+    CUDA's cache prevents the next seed from starting while tensors, CUDA graphs,
+    or DataLoader pin-memory buffers from the previous seed are still reachable.
+    """
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def resolve_compile_request(model_name: str, dcfg: dict[str, Any], training_cfg: dict[str, Any]) -> bool:
@@ -696,6 +719,7 @@ def main() -> None:
                 if record_completed_skip(run_dir, dataset_name, model_name, seed, "time_dependent", raw_rows, effective_batch_sizes, epoch_times, logger):
                     completed += 1
                     continue
+                model_for_eval = None
                 try:
                     result, rows, model_for_eval = run_time_dependent_once(dataset_name, model_name, seed, dcfg, cfg, datasets, in_ch, out_ch, run_dir, device, logger)
                     test_metrics = result["test_metrics"]
@@ -722,6 +746,9 @@ def main() -> None:
                     save_failed_run(run_dir, err)
                     raw_rows.append(err); failures.append(err)
                     logger.error("Run failed: %s", err)
+                finally:
+                    model_for_eval = None
+                    cleanup_after_run()
 
     if RUN_CONSTELLARATION:
         dataset_name = "constellaration_equilibrium"
@@ -750,6 +777,7 @@ def main() -> None:
                             continue
                         run_cfg = build_run_cfg(dcfg, cfg.get("training", {}), dataset_name, model_name, seed, 0.0, dcfg["batch_size"], dcfg["batch_size"], None)
                         save_json(run_cfg, run_dir / "config_resolved.json")
+                        model_for_eval = None
                         try:
                             requested_bs = int(dcfg["batch_size"])
                             batch_size = requested_bs
@@ -788,6 +816,9 @@ def main() -> None:
                             resolved_config = json.loads((run_dir / "config_resolved.json").read_text(encoding="utf-8")) if (run_dir / "config_resolved.json").exists() else {}
                             err = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "equilibrium", "status": "failed", "error": str(exc), "traceback": traceback.format_exc(), "resolved_config": resolved_config}
                             save_failed_run(run_dir, err); raw_rows.append(err); failures.append(err); logger.error("Run failed: %s", err)
+                        finally:
+                            model_for_eval = None
+                            cleanup_after_run()
 
     save_json(dataset_inspection, out_root / "dataset_inspection.json")
     raw = pd.DataFrame(raw_rows)

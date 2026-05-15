@@ -51,3 +51,24 @@ def test_select_output_root_resumes_latest_protocol_directory(tmp_path: Path, mo
 
     assert out_root == Path("outputs") / newer.name
     assert resumed is True
+
+
+def test_cuda_loaders_use_spawn_worker_context() -> None:
+    class TinyDataset:
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, idx: int) -> dict:
+            return {"x": experiments.torch.tensor([idx]), "y": experiments.torch.tensor([idx])}
+
+    loaders = experiments.make_loaders(
+        {"train": TinyDataset()},
+        batch_size=1,
+        loader_cfg={"num_workers": 1, "persistent_workers": True, "pin_memory": False},
+        seed=0,
+        device=experiments.torch.device("cuda"),
+    )
+
+    context = loaders["train"].multiprocessing_context
+    assert context is not None
+    assert context.get_start_method() == "spawn"
