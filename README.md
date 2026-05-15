@@ -1,26 +1,25 @@
-# Sheaf Neural Operators for Structure-Preserving Magnetohydrodynamics
+# Sheaf Neural Operators for Structure-Preserving Magnetohydrodynamic Surrogate Modeling
 
-This repository implements a full experimental suite for **Sheaf Neural Operators for MHD**. The research goal is to compare standard neural PDE surrogate baselines against a **Sheaf Neural Operator** that encodes magnetohydrodynamic structure, with particular emphasis on controlling the magnetic divergence constraint
+This repository implements a one-command experimental suite for comparing standard neural PDE surrogate models against a **Sheaf Neural Operator** for magnetohydrodynamic (MHD) surrogate modeling.
 
-\[
-\nabla \cdot B = 0.
-\]
+The central scientific claim is not that the current datasets are already arbitrary unstructured cell complexes. Instead, the claim is that MHD fields have different physical roles, constraints, and compatibility relations. The Sheaf Neural Operator represents these coupled variables through local fibers, learned restriction maps, and incidence/Hodge-inspired communication features rather than treating every field as an interchangeable image channel.
 
 ## Why Sheaf Neural Operators for MHD?
 
-MHD fields should not be treated only as arbitrary image channels. Density, velocity, and magnetic variables play different geometric roles and satisfy different compatibility constraints. The **Sheaf Neural Operator** implemented here reflects this by:
+MHD couples density, pressure, velocity, magnetic fields, current density, and boundary/interface effects. A Sheaf Neural Operator is appropriate because it can:
 
-- representing fluid variables and magnetic variables as different local fibers;
-- coupling those fibers through learned 1x1 restriction maps;
-- adding incidence/Hodge/de Rham-inspired finite-difference features such as magnetic divergence;
-- using a curl/EMF magnetic update on the 2D Orszag-Tang grid so the learned update is divergence-free under periodic finite differences;
-- comparing against UNet and FNO baselines that operate more directly on channel stacks.
+- maintain separate local fibers for fluid and magnetic variables;
+- learn restriction/coupling maps between those fibers;
+- use incidence-inspired features such as magnetic divergence;
+- use vector-potential magnetic residual updates when periodic 3D magnetic channels are known;
+- provide ablations with or without restriction maps and incidence features;
+- support both homogeneous turbulence-style benchmarks and bounded/coupled MHD systems.
 
-The public-facing method name is **Sheaf Neural Operator**. The internal model key is `sheaf_mhd`, implemented by `SheafMHDOperator`.
+The paper-facing model name is **Sheaf Neural Operator**. The internal model key is `sheaf_mhd`, implemented by `SheafMHDOperator`.
 
 ## Datasets
 
-The one-command experiment expects the following local data layouts. The code does **not** download data.
+The code does **not** download data and does not require internet access. Place datasets under the following local paths.
 
 ### The Well `MHD_64`
 
@@ -28,44 +27,46 @@ The one-command experiment expects the following local data layouts. The code do
 datasets/wells/
 ```
 
-Loaded with:
+The Well downloader may create:
 
-```python
-from the_well.data import WellDataset
+```text
+datasets/wells/datasets/MHD_64/
 ```
 
-The dataset adapter inspects tensor shapes and converts samples to the internal 3D channel-first convention:
+The loader wraps `the_well.data.WellDataset`, inspects tensor layouts, and converts samples to:
 
 ```text
 x: [C_in, X, Y, Z]
 y: [C_out, X, Y, Z]
 ```
 
-If magnetic channel indices are provided in the config, divergence diagnostics are computed and the 3D Sheaf Neural Operator can use a vector-potential curl head for divergence-controlled magnetic updates. If channel metadata are unavailable, the configuration intentionally leaves the indices unset rather than guessing physical channels.
+The Well `MHD_64` is a homogeneous/periodic 3D MHD benchmark used for prediction accuracy, rollout stability, spectra/correlation diagnostics, divergence diagnostics, and scalability.
 
-### Orszag-Tang FARGO3D processed dataset
-
-```text
-datasets/orszag_tang/input_data/
-  density/
-  vy/
-  vz/
-  by/
-  bz/
-```
-
-The expected field order is:
+### SWIGS Gorgon MHD
 
 ```text
-[density, vy, vz, by, bz]
+datasets/swigs_gorgon/
 ```
 
-The spatial axes are interpreted as axis 0 = `y` and axis 1 = `z`. Samples are returned as:
+The SWIGS/Gorgon loader recursively discovers `.h5`, `.hdf5`, and `.hdf` files under this root. It does not assume exact shock-condition folder names. It inspects HDF5 groups and datasets, prefers MHD-relevant 3D fields when identifiable, caches an index at:
 
 ```text
-x: [5 * n_input_frames, H, W]
-y: [5, H, W]
+datasets/swigs_gorgon/.swigs_index.json
 ```
+
+SWIGS is a bounded/coupled magnetosphere-ionosphere MHD benchmark. It is the more natural dataset for the sheaf/restriction-map story because different variables and regions can be coupled through boundary/interface-type relations.
+
+### Optional ConStellaration equilibrium subset
+
+```text
+datasets/constellaration_subset/
+  boundaries_and_metrics.jsonl
+  vmecpp_wout_finite_beta_3pct.jsonl
+```
+
+This optional track is a supervised fusion-equilibrium regression problem, not a time-evolution rollout benchmark. The loader joins JSONL rows by configuration identifiers when possible, flattens numeric JSON fields into input/output vectors, standardizes features, and evaluates equilibrium surrogate models separately from time-dependent MHD rollouts.
+
+If the folder is missing, only the ConStellaration track is skipped with a logged warning.
 
 ## One-command full experiment
 
@@ -75,100 +76,96 @@ Run from the repository root:
 python experiments.py
 ```
 
-No command-line flags are required or used. By default, `experiments.py` sets:
+No command-line flags are required or used. The top of `experiments.py` exposes simple manual constants:
 
 ```python
-FULL_EXPERIMENT = True
 SMOKE_TEST = False
+RUN_THE_WELL = True
+RUN_SWIGS = True
+RUN_CONSTELLARATION = True
 ```
 
-The default suite covers both datasets, three models (`unet`, `fno`, `sheaf_mhd`), and ten random seeds (`0` through `9`). Developers can manually set `SMOKE_TEST = True` at the top of `experiments.py` for a 1-epoch local pipeline check with small sample caps, then restore it to `False` before running the full suite.
+When `SMOKE_TEST = True`, the script uses one seed, one epoch, and small sample caps for quick local checks. The committed default is `SMOKE_TEST = False`.
 
-## Models
+## Default suite
 
-### UNet baseline
+Time-dependent datasets:
 
-`UNet2D` and `UNet3D` provide compact convolutional encoder-decoder baselines.
+- `wells_mhd64`
+- `swigs_gorgon`
 
-### FNO baseline
+Time-dependent models:
 
-`FNO2D` and `FNO3D` implement Fourier Neural Operator layers directly in PyTorch using spectral convolutions, pointwise 1x1 convolutions, and GELU activations. The code does not depend on `neuraloperator`.
+- `unet3d`
+- `fno3d`
+- `sheaf_mhd` / **Sheaf Neural Operator**
 
-### Sheaf Neural Operator
+Optional equilibrium dataset:
 
-`SheafMHDOperator` separates fluid and magnetic fibers, updates each fiber with local CNN or FNO operators, exchanges information through learned sheaf-style restriction maps, and augments magnetic runs with incidence-inspired divergence information when magnetic channels are known.
+- `constellaration_equilibrium`
 
-For 2D Orszag-Tang, the magnetic head predicts a scalar EMF-like potential `a(y,z)` and applies:
+Equilibrium models:
 
-```text
-delta_by =  d a / dz
-delta_bz = -d a / dy
-by_next  = by + dt * delta_by
-bz_next  = bz + dt * delta_bz
-```
+- `mlp`
+- `sheaf_equilibrium`
 
-Because the update is a discrete curl, `div(delta_B)` is approximately zero under the same periodic finite-difference operators used for diagnostics.
+Default seeds are `0` through `9`.
 
 ## Outputs
 
-Each run creates a timestamped directory:
+Each run creates:
 
 ```text
 outputs/full_experiment_<timestamp>/
-```
-
-Important artifacts include:
-
-```text
-resolved_experiment_config.json
-experiment_log.txt
-raw_metrics.csv
-aggregate_metrics.csv
-aggregate_metrics.json
-experiment_summary.json
-paper_tables/
-  main_results.tex
-  main_results.md
-  divergence_results.tex
-  rollout_results.tex
-  pairwise_comparisons.tex
-figures/
-  loss_curves/
-  prediction_examples/
-  divergence_maps/
-  rollout_curves/
-  aggregate_barplots/
-runs/<dataset>/<model>/seed_<seed>/
-  config_resolved.json
-  train_log.csv
-  metrics_valid.json
-  metrics_test.json
-  rollout_metrics.json
-  best_model.pt
-  last_model.pt
+  resolved_experiment_config.json
+  experiment_log.txt
+  dataset_inspection.json
+  raw_metrics.csv
+  aggregate_metrics.csv
+  aggregate_metrics.json
+  experiment_summary.json
+  paper_tables/
+    main_results.tex
+    main_results.md
+    divergence_results.tex
+    rollout_results.tex
+    swigs_results.tex
+    constellaration_results.tex
+    pairwise_comparisons.tex
   figures/
+    loss_curves/
+    prediction_examples/
+    divergence_maps/
+    spectra/
+    rollout_curves/
+    aggregate_barplots/
+  runs/
+    wells_mhd64/
+      unet3d/
+      fno3d/
+      sheaf_mhd/
+    swigs_gorgon/
+      unet3d/
+      fno3d/
+      sheaf_mhd/
+    constellaration_equilibrium/
+      mlp/
+      sheaf_equilibrium/
 ```
 
-If a dataset is missing or a run fails, the failure is recorded in JSON/CSV outputs and in `experiment_summary.json`; failures are not silently skipped.
+Per-seed run directories contain resolved configs, CSV logs, validation/test metrics, checkpoints, rollout metrics for time-dependent data, and representative figures.
 
-## Metrics and statistics
+## Metrics
 
-The evaluation pipeline reports:
+For The Well and SWIGS, the suite reports MSE, MAE, relative L2, per-channel relative L2, magnetic divergence metrics when magnetic channels are known, energy-like drift, spectral error, rollout metrics, inference time, and parameter count.
 
-- MSE;
-- relative L2;
-- per-channel relative L2;
-- magnetic divergence L2;
-- relative magnetic divergence;
-- inference time per batch;
-- parameter count;
-- rollout relative L2/MSE/divergence where possible.
+For ConStellaration, the suite reports MSE, MAE, relative L2, per-target relative error, inference time, and parameter count.
 
-Aggregation over seeds includes mean, standard deviation, standard error, 95% t-confidence intervals, deterministic bootstrap confidence intervals, median, and interquartile range. Pairwise comparisons evaluate `sheaf_mhd` against `unet` and `fno` with paired tests when matching seeds are available.
+Seed aggregation includes means, standard deviations, standard errors, Student-t confidence intervals, deterministic bootstrap confidence intervals, medians, and interquartile ranges. Pairwise comparisons include `sheaf_mhd` vs `unet3d`, `sheaf_mhd` vs `fno3d`, and `sheaf_equilibrium` vs `mlp`.
 
 ## Limitations
 
-- The Well `MHD_64` is a uniform-grid benchmark, so it tests structure preservation and 3D scalability more than arbitrary cell-complex generality.
-- Orszag-Tang is 2D and uses a simplified field set.
-- This implementation builds the sheaf/cell-complex structure on structured grids. Unstructured-mesh experiments would require explicit mesh cells, faces, edges, and incidence matrices supplied by the dataset.
-- The 2D Orszag-Tang magnetic update is the most directly constrained path because the field set contains exactly the two magnetic components needed by the scalar EMF update. The 3D vector-potential curl head is available when reliable magnetic channel indices are supplied for The Well.
+- The Well `MHD_64` is a uniform-grid benchmark, so it tests structure preservation and 3D scalability more than arbitrary cell-complex geometry.
+- SWIGS is more relevant for bounded/coupled MHD structure, but HDF5 field-name conventions may require dataset inspection and automatic field mapping.
+- ConStellaration is an equilibrium surrogate problem, not a time-evolution benchmark.
+- This implementation approximates sheaf/cell-complex structure on structured arrays; a later unstructured version should use explicit cells, faces, edges, and incidence matrices.

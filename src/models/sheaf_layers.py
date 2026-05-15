@@ -5,11 +5,13 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .spectral_layers import SpectralConv2d, SpectralConv3d
+from .spectral_layers import SpectralConv3d
 
 
 def conv(dim: int):
-    return nn.Conv2d if dim == 2 else nn.Conv3d
+    if dim != 3:
+        raise ValueError(f"Only 3D grid operators are supported, got dim={dim}.")
+    return nn.Conv3d
 
 
 class RestrictionMap(nn.Module):
@@ -38,8 +40,9 @@ class FiberOperator(nn.Module):
             )
             self.pointwise = None
         elif self.backbone_type == "fno":
-            spectral = SpectralConv2d if dim == 2 else SpectralConv3d
-            self.net = spectral(channels, channels, modes)
+            if dim != 3:
+                raise ValueError("FNO sheaf fiber backbones are implemented for 3D grids.")
+            self.net = SpectralConv3d(channels, channels, modes)
             self.pointwise = C(channels, channels, 1)
         else:
             raise ValueError(f"Unknown sheaf fiber backbone_type={backbone_type!r}; expected 'cnn' or 'fno'.")

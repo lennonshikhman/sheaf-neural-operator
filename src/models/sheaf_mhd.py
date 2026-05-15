@@ -1,21 +1,20 @@
-"""Sheaf Neural Operator for structure-preserving MHD."""
+"""Sheaf Neural Operator for 3D MHD surrogate modeling."""
 from __future__ import annotations
 
 import torch
 from torch import nn
 
 from .sheaf_layers import SheafMessageBlock, conv
-from src.physics.curl import periodic_curl_scalar_2d, curl_vector_potential_3d
-from src.physics.divergence import periodic_divergence_2d, periodic_divergence_3d
+from src.physics.curl import curl_vector_potential_3d
+from src.physics.divergence import periodic_divergence_3d
 
 
 class SheafMHDOperator(nn.Module):
-    """Sheaf Neural Operator with fluid/magnetic fibers and curl-constrained magnetic updates.
+    """Sheaf Neural Operator with fluid/magnetic fibers for 3D MHD grids.
 
-    Public model name: Sheaf Neural Operator. Internal identifier: sheaf_mhd.
-    In 2D with two magnetic channels the model predicts a scalar EMF. In 3D with
-    three magnetic channels and ``constrained_magnetic_update=True`` it predicts a
-    vector potential and updates B through a discrete curl.
+    Public model name: Sheaf Neural Operator. Internal identifier: ``sheaf_mhd``.
+    Magnetic channels can be updated either through a vector-potential residual
+    ``curl(A)`` or through a direct residual head augmented with divergence features.
     """
 
     def __init__(
@@ -26,32 +25,38 @@ class SheafMHDOperator(nn.Module):
         hidden_channels: int = 64,
         num_layers: int = 4,
         backbone_type: str = "cnn",
-        modes: int = 16,
+        modes: int = 8,
         periodic: bool = True,
         dt: float = 1.0,
         spacing: list[float] | None = None,
         magnetic_field_indices: list[int] | None = None,
         fluid_field_indices: list[int] | None = None,
-        constrained_magnetic_update: bool = True,
+        constrained_magnetic_update: str | bool = "direct_with_divergence_features",
         use_restriction_maps: bool = True,
         use_incidence_features: bool = True,
     ):
         super().__init__()
-        if dim not in {2, 3}:
-            raise ValueError(f"SheafMHDOperator supports dim=2 or dim=3, got {dim}.")
+        if dim != 3:
+            raise ValueError(f"SheafMHDOperator is configured for 3D MHD grids; got dim={dim}.")
         self.dim = dim
         self.out_channels = out_channels
         self.dt = dt
         self.periodic = periodic
-        self.spacing = spacing or [1.0] * dim
-        self.magnetic_field_indices = magnetic_field_indices or ([] if dim == 3 else [3, 4])
+        self.spacing = spacing or [1.0, 1.0, 1.0]
+        self.magnetic_field_indices = magnetic_field_indices or []
         self.fluid_field_indices = fluid_field_indices or [i for i in range(out_channels) if i not in self.magnetic_field_indices]
         self.use_incidence_features = use_incidence_features
-        self.constrained_2d = constrained_magnetic_update and dim == 2 and len(self.magnetic_field_indices) >= 2
-        self.constrained_3d = constrained_magnetic_update and dim == 3 and len(self.magnetic_field_indices) >= 3
+        if constrained_magnetic_update is True:
+            constrained_magnetic_update = "vector_potential"
+        if constrained_magnetic_update is False:
+            constrained_magnetic_update = "direct_with_divergence_features"
+        if constrained_magnetic_update not in {"vector_potential", "direct_with_divergence_features"}:
+            raise ValueError("constrained_magnetic_update must be 'vector_potential' or 'direct_with_divergence_features'.")
+        self.constrained_magnetic_update = constrained_magnetic_update
+        self.use_vector_potential = constrained_magnetic_update == "vector_potential" and len(self.magnetic_field_indices) >= 3
 
         C = conv(dim)
-        incidence_channels = 1 if use_incidence_features and self.magnetic_field_indices else 0
+        incidence_channels = 1 if use_incidence_features and len(self.magnetic_field_indices) >= 3 else 0
         self.fluid_lift = C(in_channels + incidence_channels, hidden_channels, 1)
         self.mag_lift = C(in_channels + incidence_channels, hidden_channels, 1)
         self.blocks = nn.ModuleList(
@@ -66,35 +71,18 @@ class SheafMHDOperator(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.nonmag_head = nn.Sequential(
-            C(hidden_channels, hidden_channels, 3, padding=1),
-            nn.GELU(),
-            C(hidden_channels, len(self.fluid_field_indices), 1),
-        )
-        if self.constrained_2d:
-            self.emf_head = nn.Sequential(C(hidden_channels, hidden_channels, 3, padding=1), nn.GELU(), C(hidden_channels, 1, 1))
-        elif self.constrained_3d:
-            self.vector_potential_head = nn.Sequential(
-                C(hidden_channels, hidden_channels, 3, padding=1), nn.GELU(), C(hidden_channels, 3, 1)
-            )
+        self.nonmag_head = nn.Sequential(C(hidden_channels, hidden_channels, 3, padding=1), nn.GELU(), C(hidden_channels, len(self.fluid_field_indices), 1))
+        if self.use_vector_potential:
+            self.vector_potential_head = nn.Sequential(C(hidden_channels, hidden_channels, 3, padding=1), nn.GELU(), C(hidden_channels, 3, 1))
         else:
-            mag_out = len(self.magnetic_field_indices)
-            self.mag_head = nn.Sequential(C(hidden_channels, hidden_channels, 3, padding=1), nn.GELU(), C(hidden_channels, mag_out, 1))
+            self.mag_head = nn.Sequential(C(hidden_channels, hidden_channels, 3, padding=1), nn.GELU(), C(hidden_channels, len(self.magnetic_field_indices), 1))
 
     def _incidence_features(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.use_incidence_features or not self.magnetic_field_indices:
+        if not self.use_incidence_features or len(self.magnetic_field_indices) < 3:
             return x
-        if self.dim == 2 and len(self.magnetic_field_indices) >= 2:
-            by = x[:, self.magnetic_field_indices[0] % x.shape[1]]
-            bz = x[:, self.magnetic_field_indices[1] % x.shape[1]]
-            div = periodic_divergence_2d(by, bz, self.spacing[0], self.spacing[1]).unsqueeze(1)
-            return torch.cat([x, div], dim=1)
-        if self.dim == 3 and len(self.magnetic_field_indices) >= 3:
-            bx, by, bz = [x[:, idx % x.shape[1]] for idx in self.magnetic_field_indices[:3]]
-            div = periodic_divergence_3d(bx, by, bz, self.spacing[0], self.spacing[1], self.spacing[2]).unsqueeze(1)
-            return torch.cat([x, div], dim=1)
-        zeros = torch.zeros(x.shape[0], 1, *x.shape[2:], dtype=x.dtype, device=x.device)
-        return torch.cat([x, zeros], dim=1)
+        bx, by, bz = [x[:, idx % x.shape[1]] for idx in self.magnetic_field_indices[:3]]
+        div = periodic_divergence_3d(bx, by, bz, self.spacing[0], self.spacing[1], self.spacing[2]).unsqueeze(1)
+        return torch.cat([x, div], dim=1)
 
     def _base_channel(self, x: torch.Tensor, idx: int) -> torch.Tensor | float:
         return x[:, idx] if idx < x.shape[1] else 0.0
@@ -111,13 +99,7 @@ class SheafMHDOperator(nn.Module):
         for j, idx in enumerate(self.fluid_field_indices[: fluid_delta.shape[1]]):
             out[:, idx] = self._base_channel(x, idx) + fluid_delta[:, j]
 
-        if self.constrained_2d:
-            a = self.emf_head(magnetic)[:, 0]
-            dby, dbz = periodic_curl_scalar_2d(a, self.spacing[0], self.spacing[1])
-            by_idx, bz_idx = self.magnetic_field_indices[:2]
-            out[:, by_idx] = self._base_channel(x, by_idx) + self.dt * dby
-            out[:, bz_idx] = self._base_channel(x, bz_idx) + self.dt * dbz
-        elif self.constrained_3d:
+        if self.use_vector_potential:
             potential = self.vector_potential_head(magnetic)
             dbx, dby, dbz = curl_vector_potential_3d(
                 potential[:, 0], potential[:, 1], potential[:, 2], self.spacing[0], self.spacing[1], self.spacing[2]

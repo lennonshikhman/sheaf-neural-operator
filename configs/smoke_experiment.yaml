@@ -1,5 +1,6 @@
 project: Sheaf Neural Operators for MHD smoke test
-models: [unet, fno, sheaf_mhd]
+time_dependent_models: [unet3d, fno3d, sheaf_mhd]
+equilibrium_models: [mlp, sheaf_equilibrium]
 seeds: [0]
 smoke_overrides:
   epochs: 1

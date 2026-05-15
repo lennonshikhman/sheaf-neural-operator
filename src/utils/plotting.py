@@ -11,7 +11,7 @@ import pandas as pd
 
 
 def _image_slice(a):
-    arr = a.detach().cpu() if hasattr(a, "detach") else np.asarray(a)
+    arr = a.detach().cpu().numpy() if hasattr(a, "detach") else np.asarray(a)
     while arr.ndim > 2:
         arr = arr[..., arr.shape[-1] // 2]
     return arr
@@ -94,6 +94,24 @@ def plot_aggregate_bars(agg, out_path, metric="relative_l2"):
     plt.bar(labels, y, yerr=err)
     plt.ylabel(metric)
     plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_spectra(pred, target, out_path):
+    from src.physics.spectra import isotropic_power_spectrum_3d
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    ps_pred = isotropic_power_spectrum_3d(pred).detach().cpu().numpy()
+    ps_target = isotropic_power_spectrum_3d(target).detach().cpu().numpy()
+    x = np.arange(len(ps_pred))
+    plt.figure()
+    plt.loglog(x[1:] + 1, ps_target[1:] + 1e-12, label="target")
+    plt.loglog(x[1:] + 1, ps_pred[1:] + 1e-12, label="prediction")
+    plt.xlabel("isotropic wavenumber bin")
+    plt.ylabel("power")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()

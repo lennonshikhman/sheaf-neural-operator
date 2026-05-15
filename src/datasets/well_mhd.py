@@ -1,8 +1,6 @@
 """The Well MHD_64 dataset adapter."""
 from __future__ import annotations
 
-import importlib
-import importlib.util
 from pathlib import Path
 from typing import Any
 
@@ -38,9 +36,8 @@ class WellMHD64Dataset(Dataset):
         self.magnetic_field_indices = magnetic_field_indices
         if not self.data_root.exists():
             raise FileNotFoundError(f"The Well root not found: {self.data_root}")
-        if importlib.util.find_spec("the_well") is None:
-            raise ImportError("Install the_well to load MHD_64: pip install the_well")
-        WellDataset = importlib.import_module("the_well.data").WellDataset
+        from the_well.data import WellDataset
+
         self.ds = WellDataset(well_base_path=str(self.data_root), well_dataset_name="MHD_64", well_split_name=split)
         self._len = len(self.ds) if max_samples is None else min(len(self.ds), max_samples)
         self.mean = None

@@ -21,7 +21,7 @@ def summarize(values, bootstrap: int = 10000, seed: int = 123):
     tcrit = float(scipy_stats.t.ppf(0.975, n - 1)) if scipy_stats and n > 1 else 1.96
     rng = np.random.default_rng(seed)
     reps = min(bootstrap, 10000)
-    boots = rng.choice(x, size=(reps, n), replace=True).mean(axis=1) if n else np.array([np.nan])
+    boots = rng.choice(x, size=(reps, n), replace=True).mean(axis=1)
     q75, q25 = np.percentile(x, [75, 25])
     return dict(
         mean=mean,
@@ -38,35 +38,42 @@ def summarize(values, bootstrap: int = 10000, seed: int = 123):
 
 
 def aggregate_metrics(raw: pd.DataFrame) -> pd.DataFrame:
-    metrics = [c for c in raw.columns if c not in {"dataset", "model", "seed", "status", "error"} and pd.api.types.is_numeric_dtype(raw[c])]
+    metrics = [c for c in raw.columns if c not in {"dataset", "model", "seed", "status", "error", "track"} and pd.api.types.is_numeric_dtype(raw[c])]
     rows = []
-    for (ds, model), g in raw.groupby(["dataset", "model"]):
-        for m in metrics:
-            rows.append({"dataset": ds, "model": model, "metric": m, **summarize(g[m].to_numpy())})
+    for keys, g in raw.groupby(["dataset", "model"]):
+        ds, model = keys
+        for metric in metrics:
+            rows.append({"dataset": ds, "model": model, "metric": metric, **summarize(g[metric].to_numpy())})
     return pd.DataFrame(rows)
 
 
+def _comparison_pairs(dataset: str) -> list[tuple[str, str]]:
+    if dataset == "constellaration_equilibrium":
+        return [("sheaf_equilibrium", "mlp")]
+    return [("sheaf_mhd", "unet3d"), ("sheaf_mhd", "fno3d")]
+
+
 def pairwise_comparisons(raw: pd.DataFrame, metrics=None) -> pd.DataFrame:
-    metrics = metrics or ["relative_l2", "mse", "magnetic_divergence_l2", "mean_rollout_relative_l2"]
+    metrics = metrics or ["relative_l2", "mse", "mae", "magnetic_divergence_l2", "mean_rollout_relative_l2", "spectral_error_3d"]
     rows = []
     for ds, gds in raw.groupby("dataset"):
-        for base in ["unet", "fno"]:
+        for challenger, baseline in _comparison_pairs(ds):
             for metric in metrics:
                 if metric not in gds:
                     continue
-                s = gds[gds.model == "sheaf_mhd"][["seed", metric]].merge(
-                    gds[gds.model == base][["seed", metric]], on="seed", suffixes=("_sheaf", "_" + base)
-                )
+                left = gds[gds.model == challenger][["seed", metric]]
+                right = gds[gds.model == baseline][["seed", metric]]
+                s = left.merge(right, on="seed", suffixes=("_challenger", "_baseline"))
                 if s.empty:
                     continue
-                diff = s[f"{metric}_sheaf"] - s[f"{metric}_{base}"]
-                mean_base = s[f"{metric}_{base}"].mean()
+                diff = s[f"{metric}_challenger"] - s[f"{metric}_baseline"]
+                mean_base = s[f"{metric}_baseline"].mean()
                 summ = summarize(diff)
-                p = float(scipy_stats.ttest_rel(s[f"{metric}_sheaf"], s[f"{metric}_{base}"], nan_policy="omit").pvalue) if scipy_stats and len(s) > 1 else np.nan
+                p = float(scipy_stats.ttest_rel(s[f"{metric}_challenger"], s[f"{metric}_baseline"], nan_policy="omit").pvalue) if scipy_stats and len(s) > 1 else np.nan
                 rows.append(
                     {
                         "dataset": ds,
-                        "comparison": f"sheaf_mhd_vs_{base}",
+                        "comparison": f"{challenger}_vs_{baseline}",
                         "metric": metric,
                         "mean_difference": summ["mean"],
                         "relative_percent_improvement": float(-100 * summ["mean"] / mean_base) if mean_base else np.nan,
