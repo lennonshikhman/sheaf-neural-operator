@@ -1,19 +1,26 @@
-project: Sheaf Neural Operators for Structure-Preserving Magnetohydrodynamic Surrogate Modeling
+project: Sheaf Neural Operators for Structure-Preserving Magnetohydrodynamic Surrogate
+  Modeling
 datasets:
   wells_mhd64:
     data_root: ./datasets/wells/datasets
     dim: 3
     n_input_frames: 1
     n_output_frames: 1
-    batch_size: 1
+    batch_size: 2
     epochs: 20
     lr: 0.0005
-    weight_decay: 0.000001
+    weight_decay: 1.0e-06
     hidden_channels: 32
     num_layers: 4
     modes: 8
-    spacing: [1.0, 1.0, 1.0]
-    magnetic_field_indices: [1, 2, 3]
+    spacing:
+    - 1.0
+    - 1.0
+    - 1.0
+    magnetic_field_indices:
+    - 1
+    - 2
+    - 3
     fluid_field_indices: null
     periodic: true
     constrained_magnetic_update: vector_potential
@@ -22,24 +29,36 @@ datasets:
     max_train_samples: null
     max_valid_samples: null
     max_test_samples: null
+    crop_size: 48
+    use_cache: true
+    rebuild_cache: false
+    cache_root: datasets/cache
   swigs_gorgon:
     data_root: ./datasets/swigs_gorgon
     dim: 3
     n_input_frames: 1
     n_output_frames: 1
     field_mode: ms_required
-    required_fields: [P, Bvec_c]
-    spatial_downsample: 8
+    required_fields:
+    - P
+    - Bvec_c
+    spatial_downsample: 4
     crop_shape: null
-    batch_size: 1
+    batch_size: 2
     epochs: 20
     lr: 0.0005
-    weight_decay: 0.000001
+    weight_decay: 1.0e-06
     hidden_channels: 32
     num_layers: 4
     modes: 8
-    spacing: [1.0, 1.0, 1.0]
-    magnetic_field_indices: [1, 2, 3]
+    spacing:
+    - 1.0
+    - 1.0
+    - 1.0
+    magnetic_field_indices:
+    - 1
+    - 2
+    - 3
     fluid_field_indices: null
     periodic: false
     constrained_magnetic_update: direct_with_divergence_features
@@ -48,24 +67,58 @@ datasets:
     max_train_samples: null
     max_valid_samples: null
     max_test_samples: null
+    downsample_by: 4
+    use_cache: true
+    rebuild_cache: false
+    cache_root: datasets/cache
+    optional_fields:
+    - jvec
   constellaration_equilibrium:
     data_root: ./datasets/constellaration_subset
     optional: true
-    batch_size: 64
+    batch_size: 128
     epochs: 100
     lr: 0.001
-    weight_decay: 0.000001
+    weight_decay: 1.0e-06
     hidden_channels: 256
     num_layers: 4
     max_train_samples: null
     max_valid_samples: null
     max_test_samples: null
-time_dependent_models: [unet3d, fno3d, sheaf_mhd]
-equilibrium_models: [mlp, sheaf_equilibrium]
-seeds: [0,1,2,3,4,5,6,7,8,9]
+time_dependent_models:
+- unet3d
+- fno3d
+- sheaf_mhd
+equilibrium_models:
+- mlp
+- sheaf_equilibrium
+seeds:
+- 0
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
 training:
   mixed_precision: false
   grad_clip_norm: 1.0
   cosine_schedule: true
-  num_workers: 0
+  num_workers: 4
   rollout_steps: 5
+  use_amp: true
+  amp_dtype: bf16
+  use_compile: true
+  compile_mode: reduce-overhead
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  model_compile_defaults:
+    unet3d: true
+    fno3d: false
+    sheaf_mhd: false
+    mlp: true
+    sheaf_equilibrium: false
