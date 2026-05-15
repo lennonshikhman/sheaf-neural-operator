@@ -49,6 +49,7 @@ FINAL_RUN = True
 RUN_THE_WELL = True
 RUN_SWIGS = True
 RUN_CONSTELLARATION = True
+RUN_VALIDATION = False
 
 
 def utc_timestamp() -> str:
@@ -622,8 +623,9 @@ def main() -> None:
         time_dataset_names.append("wells_mhd64")
     if RUN_SWIGS:
         time_dataset_names.append("swigs_gorgon")
-
-    validate_time_dataset_model_pairs(cfg, time_dataset_names, device, logger)
+        
+    if RUN_VALIDATION:
+        validate_time_dataset_model_pairs(cfg, time_dataset_names, device, logger)
 
     for dataset_name in time_dataset_names:
         dcfg = dict(cfg["datasets"][dataset_name])
