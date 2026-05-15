@@ -26,13 +26,25 @@ def _target_at_step(batch: dict, default_target: torch.Tensor, step: int, device
     return default_target
 
 
+def _mark_compiled_step_begin() -> None:
+    compiler = getattr(torch, "compiler", None)
+    marker = getattr(compiler, "cudagraph_mark_step_begin", None) if compiler is not None else None
+    if marker is not None:
+        marker()
+
+
 def _autoregressive_input(current: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
-    """Update the autoregressive state while preserving input-channel width."""
+    """Update autoregressive state while preserving input-channel width.
+
+    Compiled CUDA-graph models may reuse their output storage on the next replay.
+    The rollout state must therefore own cloned storage before it is fed back as
+    the next input; otherwise torch.compile can raise an overwritten-output error.
+    """
     if prediction.shape[1] == current.shape[1]:
-        return prediction
+        return prediction.detach().clone()
     if prediction.shape[1] > current.shape[1]:
-        return prediction[:, -current.shape[1] :]
-    return torch.cat([current[:, prediction.shape[1] :], prediction], dim=1)
+        return prediction[:, -current.shape[1] :].detach().clone()
+    return torch.cat([current[:, prediction.shape[1] :], prediction], dim=1).detach().clone()
 
 
 @torch.no_grad()
@@ -49,6 +61,7 @@ def rollout_evaluate(model, loader, device, steps: int = 5, magnetic_field_indic
         cur = x
         batches += 1
         for step in range(steps):
+            _mark_compiled_step_begin()
             pred = model(cur)
             target = _target_at_step(batch, y, step, device)
             finite = torch.isfinite(pred).all()
