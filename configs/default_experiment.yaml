@@ -1,7 +1,7 @@
 project: Sheaf Neural Operators for Structure-Preserving Magnetohydrodynamic Surrogate Modeling
 datasets:
   wells_mhd64:
-    data_root: ./datasets/wells
+    data_root: ./datasets/wells/datasets
     dim: 3
     n_input_frames: 1
     n_output_frames: 1

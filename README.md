@@ -24,16 +24,10 @@ The code does **not** download data and does not require internet access. Place 
 ### The Well `MHD_64`
 
 ```text
-datasets/wells/
-```
-
-The Well downloader may create:
-
-```text
 datasets/wells/datasets/MHD_64/
 ```
 
-The loader wraps `the_well.data.WellDataset`, inspects tensor layouts, and converts samples to:
+The loader also accepts the older parent root `datasets/wells/` and resolves the nested `datasets/` directory automatically. It wraps `the_well.data.WellDataset`, inspects tensor layouts, and converts samples to:
 
 ```text
 x: [C_in, X, Y, Z]
