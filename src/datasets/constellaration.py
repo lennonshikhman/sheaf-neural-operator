@@ -55,9 +55,15 @@ class ConStellarationDataset(Dataset):
         joined = []
         for i, inp in enumerate(inputs):
             rid = self._row_id(inp)
-            target = target_by_id.get(rid) if rid is not None else (targets[i] if i < len(targets) else None)
+            target = target_by_id.get(rid) if rid is not None else None
+            if target is None and i < len(targets):
+                # Public subsets are sometimes exported as aligned JSONL files
+                # with different identifier fields on each side.  Preserve the
+                # id join when it succeeds, but fall back to row order instead
+                # of skipping every row on id-schema mismatches.
+                target = targets[i]
             if target is not None:
-                joined.append({"input": inp, "target": target, "id": rid or str(i)})
+                joined.append({"input": inp, "target": target, "id": rid or self._row_id(target) or str(i)})
         return joined
 
     def _vectorize(self, rows: list[dict[str, Any]]):

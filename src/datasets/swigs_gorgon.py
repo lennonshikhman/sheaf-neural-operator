@@ -53,7 +53,51 @@ def _extract_time(path: Path) -> float | None:
 
 
 def _compatible_shape(shape: list[int]) -> bool:
-    return len(shape) == 3 and min(shape) > 1
+    squeezed = [dim for dim in shape if dim != 1]
+    return len(squeezed) == 3 and min(squeezed) > 1
+
+
+def _slice_field_key(dataset_key: str, axis: int, index: int) -> str:
+    return f"{dataset_key}::axis{axis}[{index}]"
+
+
+def _parse_field_key(field_key: str) -> tuple[str, int | None, int | None]:
+    match = re.match(r"^(?P<dataset>.*)::axis(?P<axis>-?\d+)\[(?P<index>\d+)\]$", field_key)
+    if match is None:
+        return field_key, None, None
+    return match.group("dataset"), int(match.group("axis")), int(match.group("index"))
+
+
+def _candidate_fields(datasets: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Expand HDF5 datasets into readable 3D field candidates.
+
+    Gorgon exports are not completely uniform: some files store each physical
+    field as its own 3D dataset, some include singleton dimensions, and some
+    pack several components into a leading or trailing channel axis.  This
+    normalizes those layouts into field keys that ``_read_fields`` can load.
+    """
+    candidates: dict[str, dict[str, Any]] = {}
+    for key, value in datasets.items():
+        shape = list(value["shape"])
+        if _compatible_shape(shape):
+            entry = dict(value)
+            entry["field_shape"] = [dim for dim in shape if dim != 1]
+            candidates[key] = entry
+            continue
+        if len(shape) == 4:
+            for axis, dim in enumerate(shape):
+                remaining = [size for i, size in enumerate(shape) if i != axis and size != 1]
+                if 1 < dim <= 32 and len(remaining) == 3 and min(remaining) > 1:
+                    for index in range(dim):
+                        field_key = _slice_field_key(key, axis, index)
+                        entry = dict(value)
+                        entry["field_shape"] = remaining
+                        entry["source_dataset"] = key
+                        entry["slice_axis"] = axis
+                        entry["slice_index"] = index
+                        candidates[field_key] = entry
+                    break
+    return candidates
 
 
 class SWIGSGorgonDataset(Dataset):
@@ -113,14 +157,14 @@ class SWIGSGorgonDataset(Dataset):
         usable: list[tuple[Path, dict[str, Any], dict[str, dict[str, Any]]]] = []
         skipped: list[dict[str, Any]] = []
         for path, inspection in zip(files, inspections, strict=True):
-            candidates = {key: value for key, value in inspection["datasets"].items() if _compatible_shape(value["shape"])}
+            candidates = _candidate_fields(inspection["datasets"])
             if len(candidates) >= 4:
                 usable.append((path, inspection, candidates))
             else:
-                skipped.append({"path": str(path), "reason": "fewer than four compatible 3D arrays", "compatible_fields": list(candidates)})
+                skipped.append({"path": str(path), "reason": "fewer than four compatible 3D fields", "compatible_fields": list(candidates)})
         if not usable:
             raise ValueError(
-                f"No SWIGS/Gorgon HDF5 files under {self.data_root} contained at least four compatible 3D field arrays. "
+                f"No SWIGS/Gorgon HDF5 files under {self.data_root} contained at least four compatible 3D fields. "
                 "Parameter-only IS files are skipped automatically; check dataset_inspection.json for file contents."
             )
 
@@ -184,7 +228,7 @@ class SWIGSGorgonDataset(Dataset):
         return [sorted(group) for _, group in sorted(groups.items(), key=lambda item: str(item[0])) if len(group) >= self.n_input_frames + self.n_output_frames]
 
     def _select_fields(self, candidates: dict[str, dict[str, Any]]) -> tuple[list[str], list[str], bool]:
-        canonical_to_key = {_canonical(key): key for key in candidates}
+        canonical_to_key = {_canonical(_parse_field_key(key)[0]): key for key in candidates}
         selected: list[tuple[str, str]] = []
         for physical, aliases in MHD_PRIORITY.items():
             for alias in aliases:
@@ -202,7 +246,11 @@ class SWIGSGorgonDataset(Dataset):
         if len(sorted_candidates) < 4:
             raise ValueError("Could not infer at least four SWIGS/Gorgon 3D fields.")
         keys = [key for key, _ in sorted_candidates]
-        names = [Path(key).name for key in keys]
+        names = []
+        for key in keys:
+            dataset_key, slice_axis, slice_index = _parse_field_key(key)
+            base_name = Path(dataset_key).name
+            names.append(base_name if slice_axis is None else f"{base_name}_{slice_index}")
         return keys, names, True
 
     def _split_samples(self, samples: list[dict[str, Any]], split: str) -> list[dict[str, Any]]:
@@ -221,9 +269,13 @@ class SWIGSGorgonDataset(Dataset):
         arrays = []
         with h5py.File(path, "r") as h5:
             for key in self.field_keys:
-                arr = np.asarray(h5[key][...], dtype=np.float32)
+                dataset_key, slice_axis, slice_index = _parse_field_key(key)
+                arr = np.asarray(h5[dataset_key][...], dtype=np.float32)
+                if slice_axis is not None and slice_index is not None:
+                    arr = np.take(arr, slice_index, axis=slice_axis)
+                arr = np.squeeze(arr)
                 if arr.ndim != 3:
-                    raise ValueError(f"Selected SWIGS field {key} in {path} is shape {arr.shape}, expected 3D")
+                    raise ValueError(f"Selected SWIGS field {key} in {path} is shape {arr.shape}, expected 3D after slicing/squeezing")
                 arrays.append(arr)
         return torch.tensor(np.stack(arrays), dtype=torch.float32)
 
