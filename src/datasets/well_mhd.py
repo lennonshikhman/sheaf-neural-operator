@@ -1,19 +1,33 @@
-"""The Well MHD_64 dataset adapter."""
+"""The Well MHD_64 HDF5 dataset adapter."""
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
+import h5py
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 
 class WellMHD64Dataset(Dataset):
-    """Channel-first adapter for ``the_well.data.WellDataset``.
+    """Read local The Well ``MHD_64`` files as channel-first 3D states.
 
-    Internal 3D convention is x=[C_in,X,Y,Z], y=[C_out,X,Y,Z]. The adapter inspects
-    tensors returned by The Well and folds input time into channels.
+    The local HDF5 layout stores density under ``t0_fields`` and vector fields
+    under ``t1_fields``::
+
+        t0_fields/density        [n_traj, time, x, y, z]
+        t1_fields/magnetic_field [n_traj, time, x, y, z, 3]
+        t1_fields/velocity       [n_traj, time, x, y, z, 3]
+
+    Each one-frame state is returned as seven channels ordered as
+    ``density, Bx, By, Bz, vx, vy, vz``. Input frames are folded into the
+    channel axis, so ``x`` has shape ``[7*n_input_frames, X, Y, Z]`` and ``y``
+    has shape ``[7*n_output_frames, X, Y, Z]``.
     """
+
+    field_names = ["density", "bx", "by", "bz", "vx", "vy", "vz"]
+    field_keys = ["t0_fields/density", "t1_fields/magnetic_field", "t1_fields/velocity"]
 
     def __init__(
         self,
@@ -30,27 +44,22 @@ class WellMHD64Dataset(Dataset):
         self.split = split
         self.n_input_frames = n_input_frames
         self.n_output_frames = n_output_frames
-        self.max_samples = max_samples
         self.normalize = normalize
         self.channels = channels
-        self.magnetic_field_indices = magnetic_field_indices
+        self.magnetic_field_indices = magnetic_field_indices or [1, 2, 3]
         if not self.data_root.exists():
             raise FileNotFoundError(f"The Well root not found: {self.data_root}")
-        from the_well.data import WellDataset
-
         self.well_base_path = self._resolve_well_base_path()
-        self.ds = WellDataset(well_base_path=str(self.well_base_path), well_dataset_name="MHD_64", well_split_name=split)
-        self._len = len(self.ds) if max_samples is None else min(len(self.ds), max_samples)
-        self.mean = None
-        self.std = None
+        self.split_dir = self.well_base_path / "MHD_64" / "data" / split
+        self.samples = self._build_samples()
+        if max_samples is not None:
+            self.samples = self.samples[:max_samples]
+        if not self.samples:
+            raise FileNotFoundError(f"No The Well MHD_64 samples for split={split} under {self.split_dir}")
+        self.mean, self.std = self._estimate_stats() if normalize else (None, None)
 
     def _resolve_well_base_path(self) -> Path:
-        """Return the directory that contains the ``MHD_64`` dataset folder.
-
-        The Well's downloader has used both ``<root>/MHD_64`` and
-        ``<root>/datasets/MHD_64`` layouts.  ``WellDataset`` expects the parent
-        directory of ``MHD_64``, so accept either user-facing root.
-        """
+        """Return the directory that contains the ``MHD_64`` dataset folder."""
         candidates = [
             self.data_root,
             self.data_root / "datasets",
@@ -60,96 +69,81 @@ class WellMHD64Dataset(Dataset):
             split_dir = candidate / "MHD_64" / "data" / self.split
             if split_dir.is_dir() and any(split_dir.glob("*.hdf5")):
                 return candidate
-        for candidate in candidates:
-            if (candidate / "MHD_64").exists():
-                return candidate
         expected = " or ".join(str(c / "MHD_64" / "data" / self.split) for c in candidates[:2])
         raise FileNotFoundError(f"No The Well MHD_64 HDF5 files found; expected files under {expected}")
 
-    def __len__(self) -> int:
-        return self._len
+    def _build_samples(self) -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
+        window = self.n_input_frames + self.n_output_frames
+        for path in sorted(self.split_dir.glob("*.hdf5")):
+            with h5py.File(path, "r") as h5:
+                missing = [key for key in self.field_keys if key not in h5]
+                if missing:
+                    raise KeyError(f"The Well file {path} is missing required datasets: {missing}")
+                density_shape = h5["t0_fields/density"].shape
+                magnetic_shape = h5["t1_fields/magnetic_field"].shape
+                velocity_shape = h5["t1_fields/velocity"].shape
+                if len(density_shape) != 5 or len(magnetic_shape) != 6 or len(velocity_shape) != 6:
+                    raise ValueError(
+                        f"Unexpected The Well shapes in {path}: density={density_shape}, "
+                        f"magnetic_field={magnetic_shape}, velocity={velocity_shape}"
+                    )
+                if magnetic_shape[-1] != 3 or velocity_shape[-1] != 3:
+                    raise ValueError(f"Expected vector fields with trailing size 3 in {path}")
+                n_traj = min(density_shape[0], magnetic_shape[0], velocity_shape[0])
+                n_time = min(density_shape[1], magnetic_shape[1], velocity_shape[1])
+            for trajectory in range(n_traj):
+                for start_time in range(max(0, n_time - window + 1)):
+                    samples.append({"file": str(path), "trajectory": trajectory, "start_time": start_time})
+        return samples
 
-    def _extract_tensor(self, item: Any) -> torch.Tensor:
-        if isinstance(item, torch.Tensor):
-            return item.float()
-        if isinstance(item, dict):
-            for key in ("x", "input", "input_fields", "data", "fields", "u", "trajectory"):
-                if key in item and torch.is_tensor(item[key]):
-                    return item[key].float()
-            tensors = [v for v in item.values() if torch.is_tensor(v)]
-            if tensors:
-                return tensors[0].float()
-        if isinstance(item, (tuple, list)):
-            tensors = [v for v in item if torch.is_tensor(v)]
-            if tensors:
-                return tensors[0].float()
-        raise TypeError(f"Could not find tensor in WellDataset item of type {type(item)}")
-
-    def _extract_xy_tensors(self, item: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Return supervised input/target tensors when The Well yields pairs.
-
-        Some ``the_well`` versions return a full trajectory, while others return
-        adjacent supervised examples with one input frame and one output frame.
-        The old adapter only consumed the first tensor, which made paired samples
-        look like a one-frame trajectory and raised ``needs 2``.
-        """
-        if isinstance(item, dict):
-            x_keys = ("x", "input", "inputs", "input_fields")
-            y_keys = ("y", "target", "targets", "output", "outputs", "output_fields", "label", "labels")
-            x = next((item[key] for key in x_keys if key in item and torch.is_tensor(item[key])), None)
-            y = next((item[key] for key in y_keys if key in item and torch.is_tensor(item[key])), None)
-            if x is not None and y is not None:
-                return x.float(), y.float()
-            tensors = [value for value in item.values() if torch.is_tensor(value)]
-            if len(tensors) >= 2:
-                return tensors[0].float(), tensors[1].float()
-        if isinstance(item, (tuple, list)):
-            tensors = [value for value in item if torch.is_tensor(value)]
-            if len(tensors) >= 2:
-                return tensors[0].float(), tensors[1].float()
-        return None
-
-    def _to_time_channel_grid(self, u: torch.Tensor) -> torch.Tensor:
-        # Accept common layouts [T,C,X,Y,Z], [T,X,Y,Z,C], [C,T,X,Y,Z], [X,Y,Z,C], [C,X,Y,Z].
-        if u.ndim == 4:
-            c_axis = 0 if u.shape[0] <= 32 else -1
-            if c_axis == -1:
-                u = u.permute(3, 0, 1, 2)
-            u = u.unsqueeze(0)  # [T=1,C,X,Y,Z]
-        elif u.ndim == 5:
-            shapes = list(u.shape)
-            small_axes = [i for i, s in enumerate(shapes) if s <= 64]
-            if len(small_axes) < 2:
-                raise ValueError(f"Cannot infer time/channel axes for Well tensor shape {tuple(u.shape)}")
-            t_axis = 0
-            c_candidates = [i for i in small_axes if i != t_axis]
-            c_axis = min(c_candidates, key=lambda i: shapes[i]) if c_candidates else 1
-            grid_axes = [i for i in range(5) if i not in (t_axis, c_axis)]
-            u = u.permute(t_axis, c_axis, *grid_axes)
-        else:
-            raise ValueError(f"Expected 4D/5D Well tensor, got shape {tuple(u.shape)}")
+    def _read_state(self, path: str | Path, trajectory: int, time_index: int) -> torch.Tensor:
+        with h5py.File(path, "r") as h5:
+            density = np.asarray(h5["t0_fields/density"][trajectory, time_index], dtype=np.float32)[None, ...]
+            magnetic = np.asarray(h5["t1_fields/magnetic_field"][trajectory, time_index], dtype=np.float32)
+            velocity = np.asarray(h5["t1_fields/velocity"][trajectory, time_index], dtype=np.float32)
+        channels = np.concatenate([density, np.moveaxis(magnetic, -1, 0), np.moveaxis(velocity, -1, 0)], axis=0)
+        tensor = torch.tensor(channels, dtype=torch.float32)
         if self.channels is not None:
-            u = u[:, self.channels]
-        if u.ndim != 5:
-            raise ValueError(f"Well tensor normalization failed, got {tuple(u.shape)}")
-        return u.contiguous()
+            tensor = tensor[self.channels]
+        return tensor
 
-    def __getitem__(self, idx: int):
-        raw = self.ds[idx]
-        paired = self._extract_xy_tensors(raw)
-        if paired is not None:
-            x_u = self._to_time_channel_grid(paired[0])
-            y_u = self._to_time_channel_grid(paired[1])
-            if x_u.shape[0] < self.n_input_frames:
-                raise ValueError(f"Well input sample has {x_u.shape[0]} frames but needs {self.n_input_frames}")
-            if y_u.shape[0] < self.n_output_frames:
-                raise ValueError(f"Well target sample has {y_u.shape[0]} frames but needs {self.n_output_frames}")
-            x = x_u[: self.n_input_frames].reshape(-1, *x_u.shape[2:])
-            y = y_u[: self.n_output_frames].reshape(-1, *y_u.shape[2:])
-        else:
-            u = self._to_time_channel_grid(self._extract_tensor(raw))
-            if u.shape[0] < self.n_input_frames + self.n_output_frames:
-                raise ValueError(f"Well sample has {u.shape[0]} frames but needs {self.n_input_frames + self.n_output_frames}")
-            x = u[: self.n_input_frames].reshape(-1, *u.shape[2:])
-            y = u[self.n_input_frames : self.n_input_frames + self.n_output_frames].reshape(-1, *u.shape[2:])
-        return {"x": x, "y": y, "meta": {"split": self.split, "magnetic_field_indices": self.magnetic_field_indices}}
+    def _estimate_stats(self) -> tuple[torch.Tensor, torch.Tensor]:
+        states = []
+        for sample in self.samples[: min(8, len(self.samples))]:
+            states.append(self._read_state(sample["file"], sample["trajectory"], sample["start_time"]))
+        stack = torch.stack(states)
+        dims = (0, 2, 3, 4)
+        return stack.mean(dim=dims), stack.std(dim=dims).clamp_min(1e-6)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        sample = self.samples[idx]
+        start = sample["start_time"]
+        x_frames = [self._read_state(sample["file"], sample["trajectory"], start + offset) for offset in range(self.n_input_frames)]
+        y_frames = [
+            self._read_state(sample["file"], sample["trajectory"], start + self.n_input_frames + offset)
+            for offset in range(self.n_output_frames)
+        ]
+        x = torch.cat(x_frames, dim=0)
+        y = torch.cat(y_frames, dim=0)
+        if self.normalize and self.mean is not None and self.std is not None:
+            mean_x = self.mean.repeat(len(x_frames)).view(-1, 1, 1, 1)
+            std_x = self.std.repeat(len(x_frames)).view(-1, 1, 1, 1)
+            mean_y = self.mean.repeat(len(y_frames)).view(-1, 1, 1, 1)
+            std_y = self.std.repeat(len(y_frames)).view(-1, 1, 1, 1)
+            x = (x - mean_x) / std_x
+            y = (y - mean_y) / std_y
+        return {
+            "x": x,
+            "y": y,
+            "meta": {
+                **sample,
+                "split": self.split,
+                "field_names": self.field_names,
+                "field_keys": self.field_keys,
+                "magnetic_field_indices": self.magnetic_field_indices,
+            },
+        }

@@ -13,7 +13,7 @@ datasets:
     num_layers: 4
     modes: 8
     spacing: [1.0, 1.0, 1.0]
-    magnetic_field_indices: null
+    magnetic_field_indices: [1, 2, 3]
     fluid_field_indices: null
     periodic: true
     constrained_magnetic_update: vector_potential
@@ -27,7 +27,10 @@ datasets:
     dim: 3
     n_input_frames: 1
     n_output_frames: 1
-    field_mode: core_mhd
+    field_mode: ms_required
+    required_fields: [P, Bvec_c]
+    spatial_downsample: 8
+    crop_shape: null
     batch_size: 1
     epochs: 20
     lr: 0.0005
@@ -36,7 +39,7 @@ datasets:
     num_layers: 4
     modes: 8
     spacing: [1.0, 1.0, 1.0]
-    magnetic_field_indices: null
+    magnetic_field_indices: [1, 2, 3]
     fluid_field_indices: null
     periodic: false
     constrained_magnetic_update: direct_with_divergence_features

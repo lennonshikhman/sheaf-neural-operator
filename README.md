@@ -27,11 +27,12 @@ The code does **not** download data and does not require internet access. Place 
 datasets/wells/datasets/MHD_64/
 ```
 
-The loader also accepts the older parent root `datasets/wells/` and resolves the nested `datasets/` directory automatically. It wraps `the_well.data.WellDataset`, inspects tensor layouts, and converts samples to:
+The loader also accepts the older parent root `datasets/wells/` and resolves the nested `datasets/` directory automatically. It reads the local HDF5 schema directly, using `t0_fields/density`, `t1_fields/magnetic_field`, and `t1_fields/velocity` even though the scalar and vector fields live under different groups. Each one-frame state is ordered as seven channels:
 
 ```text
-x: [C_in, X, Y, Z]
-y: [C_out, X, Y, Z]
+density + magnetic_field[3] + velocity[3]
+x: [7*n_input_frames, X, Y, Z]
+y: [7*n_output_frames, X, Y, Z]
 ```
 
 The Well `MHD_64` is a homogeneous/periodic 3D MHD benchmark used for prediction accuracy, rollout stability, spectra/correlation diagnostics, divergence diagnostics, and scalability.
@@ -42,7 +43,7 @@ The Well `MHD_64` is a homogeneous/periodic 3D MHD benchmark used for prediction
 datasets/swigs_gorgon/
 ```
 
-The SWIGS/Gorgon loader recursively discovers `.h5`, `.hdf5`, and `.hdf` files under this root. It does not assume exact shock-condition folder names. It inspects HDF5 groups and datasets, prefers MHD-relevant 3D fields when identifiable, caches an index at:
+The SWIGS/Gorgon loader recursively discovers `.h5`, `.hdf5`, and `.hdf` files under this root. The first supported schema intentionally ignores ionosphere `IS` files, indexes only magnetosphere `MS` files by shock directory and timestamp, requires `P` plus `Bvec_c` at both `t` and `t+dt`, and downsamples the large `480x320x320` arrays by default before training. It caches an index at:
 
 ```text
 datasets/swigs_gorgon/.swigs_index.json
@@ -58,7 +59,7 @@ datasets/constellaration_subset/
   vmecpp_wout_finite_beta_3pct.jsonl
 ```
 
-This optional track is a supervised fusion-equilibrium regression problem, not a time-evolution rollout benchmark. The loader joins JSONL rows by configuration identifiers when possible, flattens numeric JSON fields into input/output vectors, standardizes features, and evaluates equilibrium surrogate models separately from time-dependent MHD rollouts.
+This optional track is a supervised fusion-equilibrium regression problem, not a time-evolution rollout benchmark. The loader joins JSONL rows by configuration identifiers when possible, parses JSON-valued string columns such as `boundary.json`, `metrics.json`, and WOut `json`, flattens numeric leaves into input/output vectors, standardizes features, and evaluates equilibrium surrogate models separately from time-dependent MHD rollouts.
 
 If the folder is missing, only the ConStellaration track is skipped with a logged warning.
 
