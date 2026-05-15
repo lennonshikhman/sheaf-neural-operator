@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import warnings
 
 import torch
 
@@ -61,7 +62,19 @@ class CellComplex:
         }
 
     def max_d_next_d_error(self, k: int) -> float:
+        """Return max absolute entry of d_{k+1} d_k without dense materialization.
+
+        The check is intentionally performed on CPU in float32.  CUDA sparse
+        addmm does not implement every AMP dtype (notably bfloat16), and dense
+        materialization is prohibitive for realistic 3-D grids.
+        """
         if k not in self.coboundary or k + 1 not in self.coboundary:
             return 0.0
-        prod = torch.sparse.mm(self.coboundary[k + 1], self.coboundary[k].to_dense())
-        return float(prod.abs().max().item()) if prod.numel() else 0.0
+        left = self.coboundary[k + 1].detach().to(device="cpu", dtype=torch.float32).coalesce()
+        right = self.coboundary[k].detach().to(device="cpu", dtype=torch.float32).coalesce()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Sparse CSR tensor support is in beta state.*")
+            prod = torch.sparse.mm(left, right).coalesce()
+        if prod._nnz() == 0:
+            return 0.0
+        return float(prod.values().abs().max().item())

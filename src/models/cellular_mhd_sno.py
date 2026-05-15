@@ -86,9 +86,10 @@ class CellularMHDSheafNeuralOperator(nn.Module):
         return tuple(max(4, int(round(s * scale))) for s in shape)
 
     def _complex(self, shape: tuple[int, int, int], device: torch.device, dtype: torch.dtype):
-        key = (shape, self.spacing, self.periodic, str(device), str(dtype))
+        sparse_dtype = torch.float32 if dtype in {torch.float16, torch.bfloat16} else dtype
+        key = (shape, self.spacing, self.periodic, str(device), str(sparse_dtype))
         if key not in self._complex_cache:
-            cx = get_cached_cubical_complex(*shape, spacing=self.spacing, periodic=self.periodic, device=device, dtype=dtype)
+            cx = get_cached_cubical_complex(*shape, spacing=self.spacing, periodic=self.periodic, device=device, dtype=sparse_dtype)
             self._complex_cache[key] = cx
             self._last_complex_summary = self._make_summary(cx, shape)
         return self._complex_cache[key]
