@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 
 import torch
 
@@ -21,7 +22,7 @@ def parameter_count(model) -> int:
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, magnetic_field_indices=None, spacing=None, include_spectral: bool = True) -> dict:
+def evaluate(model, loader, device, magnetic_field_indices=None, spacing=None, include_spectral: bool = True, use_amp: bool = False, amp_dtype=torch.bfloat16) -> dict:
     model.eval()
     ms: list[float] = []
     mas: list[float] = []
@@ -36,7 +37,9 @@ def evaluate(model, loader, device, magnetic_field_indices=None, spacing=None, i
     for batch in loader:
         x = batch["x"].to(device)
         y = batch["y"].to(device)
-        pred = model(x)
+        ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp and device.type == "cuda" else nullcontext()
+        with ctx:
+            pred = model(x)
         nb += 1
         ms.append(float(mse(pred, y).cpu()))
         mas.append(float(mae(pred, y).cpu()))
