@@ -94,7 +94,10 @@ def build_time_dataset(name: str, dcfg: dict[str, Any], split: str):
             dcfg.get("n_output_frames", 1),
             sample_cap(dcfg, split),
             True,
-            dcfg.get("field_mode", "core_mhd"),
+            dcfg.get("field_mode", "ms_required"),
+            required_fields=dcfg.get("required_fields"),
+            spatial_downsample=dcfg.get("spatial_downsample", 8),
+            crop_shape=dcfg.get("crop_shape"),
         )
     raise KeyError(name)
 
@@ -148,6 +151,10 @@ def inspect_dataset_sample(ds, name: str) -> dict[str, Any]:
             info[attr] = getattr(ds, attr)
     if hasattr(ds, "inspection"):
         info["inspection"] = getattr(ds, "inspection")
+    if hasattr(ds, "skipped_files"):
+        info["skipped_files"] = getattr(ds, "skipped_files")
+    if hasattr(ds, "template_file"):
+        info["template_file"] = getattr(ds, "template_file")
     return info
 
 
