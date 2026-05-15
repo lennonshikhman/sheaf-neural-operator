@@ -38,10 +38,33 @@ class WellMHD64Dataset(Dataset):
             raise FileNotFoundError(f"The Well root not found: {self.data_root}")
         from the_well.data import WellDataset
 
-        self.ds = WellDataset(well_base_path=str(self.data_root), well_dataset_name="MHD_64", well_split_name=split)
+        self.well_base_path = self._resolve_well_base_path()
+        self.ds = WellDataset(well_base_path=str(self.well_base_path), well_dataset_name="MHD_64", well_split_name=split)
         self._len = len(self.ds) if max_samples is None else min(len(self.ds), max_samples)
         self.mean = None
         self.std = None
+
+    def _resolve_well_base_path(self) -> Path:
+        """Return the directory that contains the ``MHD_64`` dataset folder.
+
+        The Well's downloader has used both ``<root>/MHD_64`` and
+        ``<root>/datasets/MHD_64`` layouts.  ``WellDataset`` expects the parent
+        directory of ``MHD_64``, so accept either user-facing root.
+        """
+        candidates = [
+            self.data_root,
+            self.data_root / "datasets",
+            self.data_root.parent if self.data_root.name == "MHD_64" else self.data_root,
+        ]
+        for candidate in candidates:
+            split_dir = candidate / "MHD_64" / "data" / self.split
+            if split_dir.is_dir() and any(split_dir.glob("*.hdf5")):
+                return candidate
+        for candidate in candidates:
+            if (candidate / "MHD_64").exists():
+                return candidate
+        expected = " or ".join(str(c / "MHD_64" / "data" / self.split) for c in candidates[:2])
+        raise FileNotFoundError(f"No The Well MHD_64 HDF5 files found; expected files under {expected}")
 
     def __len__(self) -> int:
         return self._len

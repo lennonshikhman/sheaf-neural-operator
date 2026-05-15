@@ -81,6 +81,8 @@ class SWIGSGorgonDataset(Dataset):
             raise FileNotFoundError(f"SWIGS/Gorgon root not found: {self.data_root}")
         index = self._load_or_build_index()
         self.inspection = index["inspection"]
+        self.skipped_files = index.get("skipped_files", [])
+        self.template_file = index.get("template_file")
         self.field_names = index["field_names"]
         self.field_keys = index["field_keys"]
         self.magnetic_field_indices = index.get("magnetic_field_indices")
@@ -108,28 +110,78 @@ class SWIGSGorgonDataset(Dataset):
 
     def _build_index(self, files: list[Path]) -> dict[str, Any]:
         inspections = [inspect_hdf5_file(path) for path in files]
-        first = inspections[0]
-        candidates = {k: v for k, v in first["datasets"].items() if _compatible_shape(v["shape"])}
-        if len(candidates) < 4:
-            raise ValueError(f"SWIGS/Gorgon file {first['path']} has fewer than 4 compatible 3D field arrays; found {list(candidates)}")
-        field_keys, field_names, inferred = self._select_fields(candidates)
-        times = [_extract_time(path) for path in files]
-        order = sorted(range(len(files)), key=lambda i: (float("inf") if times[i] is None else times[i], str(files[i])))
+        usable: list[tuple[Path, dict[str, Any], dict[str, dict[str, Any]]]] = []
+        skipped: list[dict[str, Any]] = []
+        for path, inspection in zip(files, inspections, strict=True):
+            candidates = {key: value for key, value in inspection["datasets"].items() if _compatible_shape(value["shape"])}
+            if len(candidates) >= 4:
+                usable.append((path, inspection, candidates))
+            else:
+                skipped.append({"path": str(path), "reason": "fewer than four compatible 3D arrays", "compatible_fields": list(candidates)})
+        if not usable:
+            raise ValueError(
+                f"No SWIGS/Gorgon HDF5 files under {self.data_root} contained at least four compatible 3D field arrays. "
+                "Parameter-only IS files are skipped automatically; check dataset_inspection.json for file contents."
+            )
+
+        # Choose the richest schema as the canonical field set, then use only files
+        # that contain those keys.  This skips SWIGS parameter files while retaining
+        # Gorgon state dumps such as *_MS_params_*.hdf5 from the tree.
+        template_path, _, template_candidates = max(usable, key=lambda item: (len(item[2]), str(item[0])))
+        field_keys, field_names, inferred = self._select_fields(template_candidates)
+        compatible_files = []
+        for path, _, candidates in usable:
+            missing = [key for key in field_keys if key not in candidates]
+            if missing:
+                skipped.append({"path": str(path), "reason": "missing selected field keys", "missing_fields": missing})
+            else:
+                compatible_files.append(path)
+        if len(compatible_files) < self.n_input_frames + self.n_output_frames:
+            raise ValueError(
+                f"Need at least {self.n_input_frames + self.n_output_frames} SWIGS/Gorgon files with schema from {template_path}; "
+                f"found {len(compatible_files)}."
+            )
+
         samples = []
-        for a, b in zip(order[:-1], order[1:], strict=False):
-            samples.append({"file_x": str(files[a]), "file_y": str(files[b]), "time_x": times[a], "time_y": times[b]})
+        for group_files in self._group_files_for_sequences(compatible_files):
+            times = [_extract_time(path) for path in group_files]
+            order = sorted(range(len(group_files)), key=lambda i: (float("inf") if times[i] is None else times[i], str(group_files[i])))
+            window = self.n_input_frames + self.n_output_frames
+            for start in range(0, len(order) - window + 1):
+                in_idx = order[start : start + self.n_input_frames]
+                out_idx = order[start + self.n_input_frames : start + window]
+                samples.append({
+                    "files_x": [str(group_files[i]) for i in in_idx],
+                    "files_y": [str(group_files[i]) for i in out_idx],
+                    "file_x": str(group_files[in_idx[-1]]),
+                    "file_y": str(group_files[out_idx[-1]]),
+                    "time_x": times[in_idx[-1]],
+                    "time_y": times[out_idx[-1]],
+                    "sequence": str(group_files[0].parent.relative_to(self.data_root)) if group_files[0].is_relative_to(self.data_root) else str(group_files[0].parent),
+                })
+        if not samples:
+            raise ValueError(f"No adjacent SWIGS/Gorgon time pairs could be built from {len(compatible_files)} compatible files.")
+        samples.sort(key=lambda sample: (sample["sequence"], float("inf") if sample["time_x"] is None else sample["time_x"], sample["file_x"]))
         magnetic = [i for i, name in enumerate(field_names) if name in {"bx", "by", "bz"}]
         magnetic_indices = magnetic if len(magnetic) >= 3 else None
         return {
             "source_files": [str(p) for p in files],
             "field_mode": self.field_mode,
             "inspection": inspections,
+            "skipped_files": skipped,
+            "template_file": str(template_path),
             "field_keys": field_keys,
             "field_names": field_names,
             "inferred_field_mapping": inferred,
             "magnetic_field_indices": magnetic_indices,
             "samples": samples,
         }
+
+    def _group_files_for_sequences(self, files: list[Path]) -> list[list[Path]]:
+        groups: dict[Path, list[Path]] = {}
+        for path in files:
+            groups.setdefault(path.parent, []).append(path)
+        return [sorted(group) for _, group in sorted(groups.items(), key=lambda item: str(item[0])) if len(group) >= self.n_input_frames + self.n_output_frames]
 
     def _select_fields(self, candidates: dict[str, dict[str, Any]]) -> tuple[list[str], list[str], bool]:
         canonical_to_key = {_canonical(key): key for key in candidates}
@@ -186,13 +238,17 @@ class SWIGSGorgonDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         sample = self.samples[idx]
-        x = self._read_fields(sample["file_x"])
-        y = self._read_fields(sample["file_y"])
+        x_frames = [self._read_fields(path) for path in sample.get("files_x", [sample["file_x"]])]
+        y_frames = [self._read_fields(path) for path in sample.get("files_y", [sample["file_y"]])]
+        x = torch.cat(x_frames, dim=0)
+        y = torch.cat(y_frames, dim=0)
         if self.normalize and self.mean is not None and self.std is not None:
-            mean = self.mean.view(-1, 1, 1, 1)
-            std = self.std.view(-1, 1, 1, 1)
+            mean = self.mean.repeat(len(x_frames)).view(-1, 1, 1, 1)
+            std = self.std.repeat(len(x_frames)).view(-1, 1, 1, 1)
             x = (x - mean) / std
-            y = (y - mean) / std
+            mean_y = self.mean.repeat(len(y_frames)).view(-1, 1, 1, 1)
+            std_y = self.std.repeat(len(y_frames)).view(-1, 1, 1, 1)
+            y = (y - mean_y) / std_y
         return {
             "x": x,
             "y": y,

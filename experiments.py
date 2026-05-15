@@ -148,6 +148,10 @@ def inspect_dataset_sample(ds, name: str) -> dict[str, Any]:
             info[attr] = getattr(ds, attr)
     if hasattr(ds, "inspection"):
         info["inspection"] = getattr(ds, "inspection")
+    if hasattr(ds, "skipped_files"):
+        info["skipped_files"] = getattr(ds, "skipped_files")
+    if hasattr(ds, "template_file"):
+        info["template_file"] = getattr(ds, "template_file")
     return info
 
 
