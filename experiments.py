@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from src.datasets.constellaration import ConStellarationDataset
 from src.datasets.swigs_gorgon import SWIGSGorgonDataset
 from src.datasets.well_mhd import WellMHD64Dataset
-from src.models import FNO3D, MLPRegressor, SheafEquilibriumMLP, SheafMHDOperator, UNet3D
+from src.models import FNO3D, MLPRegressor, SheafEquilibriumMLP, SheafMHDOperator, CellularMHDSheafNeuralOperator, UNet3D
 from src.physics.divergence import periodic_divergence_3d
 from src.training.evaluator import evaluate
 from src.training.rollout import rollout_evaluate
@@ -135,8 +135,8 @@ def build_time_model(model_name: str, in_ch: int, out_ch: int, dcfg: dict[str, A
         return UNet3D(**common)
     if model_name == "fno3d":
         return FNO3D(**common, modes=dcfg["modes"])
-    if model_name == "sheaf_mhd":
-        return SheafMHDOperator(
+    if model_name in {"sheaf_mhd", "cellular_mhd_sno"}:
+        return CellularMHDSheafNeuralOperator(
             dim=3,
             modes=dcfg["modes"],
             periodic=dcfg.get("periodic", True),
@@ -144,8 +144,10 @@ def build_time_model(model_name: str, in_ch: int, out_ch: int, dcfg: dict[str, A
             spacing=dcfg.get("spacing"),
             magnetic_field_indices=dcfg.get("magnetic_field_indices"),
             fluid_field_indices=dcfg.get("fluid_field_indices"),
-            constrained_magnetic_update=dcfg.get("constrained_magnetic_update", "direct_with_divergence_features"),
-            backbone_type=dcfg.get("sheaf_backbone_type", "cnn"),
+            max_internal_cells=dcfg.get("max_internal_cells", 32768),
+            use_sheaf_laplacian=dcfg.get("use_sheaf_laplacian", False),
+            use_geometry_conditioned_restrictions=dcfg.get("use_geometry_conditioned_restrictions", False),
+            use_geometric_hodge=dcfg.get("use_geometric_hodge", True),
             **common,
         )
     raise KeyError(model_name)
@@ -240,6 +242,8 @@ def resolve_compile_request(model_name: str, dcfg: dict[str, Any], training_cfg:
     if "use_compile" in dcfg:
         return bool(dcfg["use_compile"])
     defaults = training_cfg.get("model_compile_defaults", {})
+    if model_name == "cellular_mhd_sno" and "sheaf_mhd" in defaults:
+        return bool(defaults["sheaf_mhd"])
     if model_name in defaults:
         return bool(defaults[model_name])
     return bool(training_cfg.get("use_compile", False))
@@ -259,6 +263,26 @@ def build_run_cfg(dcfg: dict[str, Any], training_cfg: dict[str, Any], dataset_na
     })
     return run_cfg
 
+
+
+def enrich_run_cfg_from_model(run_cfg: dict[str, Any], model: Any, logger=None) -> None:
+    target = getattr(model, "module", model)
+    if hasattr(target, "complex_summary"):
+        summary = target.complex_summary()
+        if summary:
+            run_cfg["model_backend"] = summary.get("model_backend", "cellular_mhd_sno")
+            run_cfg["cell_complex"] = summary
+            if logger is not None:
+                logger.info(
+                    "model backend: %s complex type: %s grid shape: %s cells: %s coboundary nnz: %s "
+                    "magnetic placement: C^2 faces EMF placement: C^1 edges fluid placement: C^3 cells "
+                    "exact d2d1 check max error: %s use_sheaf_laplacian=%s "
+                    "use_geometry_conditioned_restrictions=%s use_geometric_hodge=%s",
+                    summary.get("model_backend"), summary.get("complex_type"), summary.get("grid_shape"),
+                    summary.get("cells_by_dim"), summary.get("coboundary_nnz"),
+                    summary.get("exact_d2d1_check_max_error"), summary.get("use_sheaf_laplacian"),
+                    summary.get("use_geometry_conditioned_restrictions"), summary.get("use_geometric_hodge"),
+                )
 
 def save_failed_run(run_dir: Path, err: dict[str, Any]) -> None:
     save_json(err, run_dir / "failed_run.json")
@@ -304,6 +328,9 @@ def run_time_dependent_once(dataset_name: str, model_name: str, seed: int, dcfg:
             model = build_time_model(model_name, in_ch, out_ch, dcfg)
             warmup_batch = next(iter(loaders["train"]))
             trainer = Trainer(model, loaders["train"], loaders["valid"], run_dir, device, run_cfg, compile_warmup_x=warmup_batch["x"])
+            with torch.no_grad(), trainer._amp_context():
+                _ = trainer.model(warmup_batch["x"][:1].to(device))
+            enrich_run_cfg_from_model(run_cfg, trainer.original_model, logger)
             save_json(run_cfg, run_dir / "config_resolved.json")
             log_run_start(logger, run_cfg)
             rows = trainer.fit()
@@ -370,6 +397,8 @@ def validate_time_dataset_model_pairs(cfg: dict[str, Any], time_dataset_names: l
                 y = batch["y"].to(device)
                 with torch.no_grad(), trainer._amp_context():
                     pred = trainer.model(x)
+                    enrich_run_cfg_from_model(run_cfg, trainer.original_model, logger)
+                    save_json(run_cfg, run_dir / "config_resolved.json")
                     loss = mhd_loss(pred, y, run_cfg.get("lambda_rel", 0.1), run_cfg.get("lambda_div", 0.0), dcfg.get("magnetic_field_indices"), dcfg.get("spacing"))
                 if not torch.isfinite(loss):
                     raise FloatingPointError("startup validation produced NaN/Inf loss")
@@ -470,6 +499,9 @@ def main() -> None:
             for model_name in cfg["time_dependent_models"]:
                 for seed in cfg["seeds"]:
                     row = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "time_dependent", "status": "failed", "error": msg}
+                    run_dir = out_root / "runs" / dataset_name / model_name / f"seed_{seed}"
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    save_failed_run(run_dir, row)
                     raw_rows.append(row); failures.append(row)
             continue
         try:
@@ -490,6 +522,9 @@ def main() -> None:
             for model_name in cfg["time_dependent_models"]:
                 for seed in cfg["seeds"]:
                     row = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "time_dependent", "status": "failed", "error": msg}
+                    run_dir = out_root / "runs" / dataset_name / model_name / f"seed_{seed}"
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    save_failed_run(run_dir, row)
                     raw_rows.append(row); failures.append(row)
             continue
 
