@@ -373,6 +373,26 @@ def make_loaders(datasets: dict[str, Any], batch_size: int, loader_cfg: dict[str
 
 
 
+def shutdown_loaders(loaders: dict[str, DataLoader] | None) -> None:
+    """Stop persistent DataLoader workers before moving to the next seed.
+
+    Full experiments create fresh train/valid/test loaders for every seed. When
+    persistent workers are enabled, those worker processes can otherwise live
+    until Python's garbage collector runs, accumulating pinned-memory and worker
+    state across seeds. Explicit shutdown keeps long resume runs from stalling in
+    later seeds.
+    """
+    if not loaders:
+        return
+    for loader in loaders.values():
+        iterator = getattr(loader, "_iterator", None)
+        shutdown = getattr(iterator, "_shutdown_workers", None) if iterator is not None else None
+        if callable(shutdown):
+            shutdown()
+        if hasattr(loader, "_iterator"):
+            loader._iterator = None
+
+
 def resolve_compile_request(model_name: str, dcfg: dict[str, Any], training_cfg: dict[str, Any]) -> bool:
     if "use_compile" in dcfg:
         return bool(dcfg["use_compile"])
@@ -442,6 +462,7 @@ def run_time_dependent_once(dataset_name: str, model_name: str, seed: int, dcfg:
     batch_size = requested_bs
     last_exc: BaseException | None = None
     while batch_size >= 1:
+        loaders: dict[str, DataLoader] | None = None
         if device.type == "cuda":
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
@@ -485,6 +506,8 @@ def run_time_dependent_once(dataset_name: str, model_name: str, seed: int, dcfg:
                 batch_size = max(1, batch_size // 2)
                 continue
             raise
+        finally:
+            shutdown_loaders(loaders)
     assert last_exc is not None
     raise last_exc
 
@@ -683,7 +706,11 @@ def main() -> None:
                     plot_loss_curve(run_dir / "train_log.csv", out_root / "figures/loss_curves" / f"{dataset_name}_{model_name}_seed_{seed}.png")
                     plot_rollout_error(rollout, run_dir / "figures/rollout_error.png")
                     plot_rollout_error(rollout, out_root / "figures/rollout_curves" / f"{dataset_name}_{model_name}_seed_{seed}.png")
-                    run_grid_figures(model_for_eval, make_loaders(datasets, result["effective_batch_size"], {**cfg.get("training", {}), **dcfg.get("dataloader", {})}, seed, device)["test"], device, run_dir, out_root / "figures", f"{dataset_name}_{model_name}_seed_{seed}", dcfg.get("magnetic_field_indices"), dcfg.get("spacing"), logger)
+                    figure_loaders = make_loaders(datasets, result["effective_batch_size"], {**cfg.get("training", {}), **dcfg.get("dataloader", {})}, seed, device)
+                    try:
+                        run_grid_figures(model_for_eval, figure_loaders["test"], device, run_dir, out_root / "figures", f"{dataset_name}_{model_name}_seed_{seed}", dcfg.get("magnetic_field_indices"), dcfg.get("spacing"), logger)
+                    finally:
+                        shutdown_loaders(figure_loaders)
                     row = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "time_dependent", "status": "completed", **test_metrics, "final_step_relative_l2": rollout.get("final_step_relative_l2"), "mean_rollout_relative_l2": rollout.get("mean_rollout_relative_l2")}
                     raw_rows.append(row)
                     save_completion_marker(run_dir, row, result["effective_batch_size"])
@@ -727,6 +754,7 @@ def main() -> None:
                             requested_bs = int(dcfg["batch_size"])
                             batch_size = requested_bs
                             while True:
+                                loaders: dict[str, DataLoader] | None = None
                                 try:
                                     run_cfg["batch_size_requested"] = requested_bs
                                     run_cfg["batch_size_effective"] = batch_size
@@ -746,6 +774,8 @@ def main() -> None:
                                         torch.cuda.empty_cache()
                                         continue
                                     raise
+                                finally:
+                                    shutdown_loaders(loaders)
                             save_json(test_metrics, run_dir / "metrics_test.json")
                             plot_loss_curve(run_dir / "train_log.csv", run_dir / "figures/loss_curve.png")
                             row = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "equilibrium", "status": "completed", **test_metrics}
