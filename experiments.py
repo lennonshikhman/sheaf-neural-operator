@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import os
 import time
 import traceback
 from typing import Any
@@ -52,6 +53,139 @@ RUN_CONSTELLARATION = True
 
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def protocol_output_prefix() -> str:
+    return "fast_dev_experiment_" if FAST_DEV_RUN else "final_experiment_"
+
+
+def select_output_root() -> tuple[Path, bool]:
+    """Return the output root for this run and whether it is resuming an existing suite.
+
+    Experiments are long-running, so by default a restarted ``python experiments.py``
+    resumes the newest output directory for the active protocol instead of creating
+    a fresh timestamped directory. Set ``EXPERIMENTS_FORCE_NEW=1`` to opt into a
+    new directory when an intentionally independent repeat is desired.
+    """
+    prefix = protocol_output_prefix()
+    outputs = Path("outputs")
+    force_new = os.environ.get("EXPERIMENTS_FORCE_NEW", "").lower() in {"1", "true", "yes"}
+    if not force_new and outputs.exists():
+        candidates = sorted(
+            (path for path in outputs.glob(f"{prefix}*") if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0], True
+    return outputs / (prefix + utc_timestamp()), False
+
+
+def read_json_if_present(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def epoch_times_from_train_log(run_dir: Path) -> list[float]:
+    train_log = run_dir / "train_log.csv"
+    if not train_log.exists():
+        return []
+    try:
+        frame = pd.read_csv(train_log)
+    except Exception:
+        return []
+    if "total_epoch_time" not in frame:
+        return []
+    return [float(value) for value in frame["total_epoch_time"].dropna()]
+
+
+def completion_marker_path(run_dir: Path) -> Path:
+    return run_dir / "complete_run.json"
+
+
+def save_completion_marker(run_dir: Path, row: dict[str, Any], effective_batch_size: int | None) -> None:
+    save_json(
+        {
+            "status": "completed",
+            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "row": row,
+            "effective_batch_size": effective_batch_size,
+            "required_files": sorted(path.name for path in run_dir.iterdir() if path.is_file()),
+        },
+        completion_marker_path(run_dir),
+    )
+
+
+def completed_run_from_disk(run_dir: Path, dataset_name: str, model_name: str, seed: int, track: str) -> tuple[dict[str, Any], int | None, list[float]] | None:
+    """Load a completed experiment row if all required result files are present.
+
+    Newer runs write ``complete_run.json`` after all metrics are saved. For
+    compatibility with already-completed runs from older versions, this also
+    accepts the complete set of metric files as proof of completion. Partial
+    directories from crashes are intentionally ignored and rerun.
+    """
+    marker = read_json_if_present(completion_marker_path(run_dir))
+    if marker and marker.get("status") == "completed" and isinstance(marker.get("row"), dict):
+        row = dict(marker["row"])
+        effective_batch_size = marker.get("effective_batch_size")
+        return row, int(effective_batch_size) if effective_batch_size is not None else None, epoch_times_from_train_log(run_dir)
+
+    config = read_json_if_present(run_dir / "config_resolved.json") or {}
+    test_metrics = read_json_if_present(run_dir / "metrics_test.json")
+    if not test_metrics:
+        return None
+
+    if track == "time_dependent":
+        rollout = read_json_if_present(run_dir / "rollout_metrics.json")
+        if not rollout:
+            return None
+        row = {
+            "dataset": dataset_name,
+            "model": model_name,
+            "seed": seed,
+            "track": track,
+            "status": "completed",
+            **test_metrics,
+            "final_step_relative_l2": rollout.get("final_step_relative_l2"),
+            "mean_rollout_relative_l2": rollout.get("mean_rollout_relative_l2"),
+        }
+    elif track == "equilibrium":
+        row = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": track, "status": "completed", **test_metrics}
+    else:
+        return None
+
+    effective_batch_size = config.get("batch_size_effective")
+    return row, int(effective_batch_size) if effective_batch_size is not None else None, epoch_times_from_train_log(run_dir)
+
+
+def record_completed_skip(
+    run_dir: Path,
+    dataset_name: str,
+    model_name: str,
+    seed: int,
+    track: str,
+    raw_rows: list[dict[str, Any]],
+    effective_batch_sizes: list[dict[str, Any]],
+    epoch_times: dict[str, list[float]],
+    logger,
+) -> bool:
+    completed = completed_run_from_disk(run_dir, dataset_name, model_name, seed, track)
+    if completed is None:
+        return False
+    row, effective_batch_size, run_epoch_times = completed
+    raw_rows.append(row)
+    if effective_batch_size is not None:
+        effective_batch_sizes.append({"dataset": dataset_name, "model": model_name, "seed": seed, "batch_size": effective_batch_size})
+    if run_epoch_times:
+        epoch_times.setdefault(f"{dataset_name}/{model_name}", []).extend(run_epoch_times)
+    logger.info("Skipping completed %s/%s seed %s; loaded complete results from %s", dataset_name, model_name, seed, run_dir)
+    return True
 
 
 def configure_torch_startup() -> None:
@@ -464,14 +598,14 @@ def main() -> None:
     start_suite = time.perf_counter()
     configure_torch_startup()
     cfg = apply_protocol(load_yaml("configs/default_experiment.yaml"))
-    out_root = Path("outputs") / (("fast_dev_experiment_" if FAST_DEV_RUN else "final_experiment_") + utc_timestamp())
+    out_root, resumed_output_root = select_output_root()
     for sub in ["paper_tables", "figures/loss_curves", "figures/prediction_examples", "figures/divergence_maps", "figures/spectra", "figures/rollout_curves", "figures/aggregate_barplots", "runs"]:
         (out_root / sub).mkdir(parents=True, exist_ok=True)
     logger = setup_logger(out_root / "experiment_log.txt")
     save_json(cfg, out_root / "resolved_experiment_config.json")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Protocol active: {'FAST_DEV_RUN' if FAST_DEV_RUN else 'FINAL_RUN'}")
-    logger.info("Starting suite on device=%s FAST_DEV_RUN=%s FINAL_RUN=%s", device, FAST_DEV_RUN, FINAL_RUN)
+    logger.info("Starting suite on device=%s FAST_DEV_RUN=%s FINAL_RUN=%s output_root=%s resumed=%s", device, FAST_DEV_RUN, FINAL_RUN, out_root, resumed_output_root)
 
     raw_rows: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
@@ -534,6 +668,9 @@ def main() -> None:
                 run_dir = out_root / "runs" / dataset_name / model_name / f"seed_{seed}"
                 run_dir.mkdir(parents=True, exist_ok=True)
                 (run_dir / "figures").mkdir(exist_ok=True)
+                if record_completed_skip(run_dir, dataset_name, model_name, seed, "time_dependent", raw_rows, effective_batch_sizes, epoch_times, logger):
+                    completed += 1
+                    continue
                 try:
                     result, rows, model_for_eval = run_time_dependent_once(dataset_name, model_name, seed, dcfg, cfg, datasets, in_ch, out_ch, run_dir, device, logger)
                     test_metrics = result["test_metrics"]
@@ -545,7 +682,9 @@ def main() -> None:
                     plot_rollout_error(rollout, run_dir / "figures/rollout_error.png")
                     plot_rollout_error(rollout, out_root / "figures/rollout_curves" / f"{dataset_name}_{model_name}_seed_{seed}.png")
                     run_grid_figures(model_for_eval, make_loaders(datasets, result["effective_batch_size"], {**cfg.get("training", {}), **dcfg.get("dataloader", {})}, seed, device)["test"], device, run_dir, out_root / "figures", f"{dataset_name}_{model_name}_seed_{seed}", dcfg.get("magnetic_field_indices"), dcfg.get("spacing"), logger)
-                    raw_rows.append({"dataset": dataset_name, "model": model_name, "seed": seed, "track": "time_dependent", "status": "completed", **test_metrics, "final_step_relative_l2": rollout.get("final_step_relative_l2"), "mean_rollout_relative_l2": rollout.get("mean_rollout_relative_l2")})
+                    row = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "time_dependent", "status": "completed", **test_metrics, "final_step_relative_l2": rollout.get("final_step_relative_l2"), "mean_rollout_relative_l2": rollout.get("mean_rollout_relative_l2")}
+                    raw_rows.append(row)
+                    save_completion_marker(run_dir, row, result["effective_batch_size"])
                     completed += 1
                     logger.info("Completed %s/%s seed %s", dataset_name, model_name, seed)
                 except Exception as exc:
@@ -577,6 +716,9 @@ def main() -> None:
                         seed_everything(seed)
                         run_dir = out_root / "runs" / dataset_name / model_name / f"seed_{seed}"
                         run_dir.mkdir(parents=True, exist_ok=True); (run_dir / "figures").mkdir(exist_ok=True)
+                        if record_completed_skip(run_dir, dataset_name, model_name, seed, "equilibrium", raw_rows, effective_batch_sizes, epoch_times, logger):
+                            completed += 1
+                            continue
                         run_cfg = build_run_cfg(dcfg, cfg.get("training", {}), dataset_name, model_name, seed, 0.0, dcfg["batch_size"], dcfg["batch_size"], None)
                         save_json(run_cfg, run_dir / "config_resolved.json")
                         try:
@@ -604,7 +746,9 @@ def main() -> None:
                                     raise
                             save_json(test_metrics, run_dir / "metrics_test.json")
                             plot_loss_curve(run_dir / "train_log.csv", run_dir / "figures/loss_curve.png")
-                            raw_rows.append({"dataset": dataset_name, "model": model_name, "seed": seed, "track": "equilibrium", "status": "completed", **test_metrics})
+                            row = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "equilibrium", "status": "completed", **test_metrics}
+                            raw_rows.append(row)
+                            save_completion_marker(run_dir, row, batch_size)
                             effective_batch_sizes.append({"dataset": dataset_name, "model": model_name, "seed": seed, "batch_size": batch_size})
                             epoch_times.setdefault(f"{dataset_name}/{model_name}", []).extend(float(r.get("total_epoch_time", 0.0)) for r in rows)
                             completed += 1
