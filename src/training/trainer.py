@@ -15,7 +15,7 @@ from src.utils.checkpoint import save_checkpoint
 
 
 class Trainer:
-    def __init__(self, model, train_loader, valid_loader, run_dir, device, cfg):
+    def __init__(self, model, train_loader, valid_loader, run_dir, device, cfg, compile_warmup_x: torch.Tensor | None = None):
         self.original_model = model.to(device)
         self.model = self.original_model
         self.train_loader = train_loader
@@ -24,25 +24,51 @@ class Trainer:
         self.device = device
         self.cfg = cfg
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.use_amp = bool(cfg.get("use_amp", cfg.get("mixed_precision", False))) and device.type == "cuda"
+        self.amp_dtype = self._resolve_amp_dtype(cfg.get("amp_dtype", "bf16"))
+        self.use_scaler = self.use_amp and str(cfg.get("amp_dtype", "bf16")).lower() in {"fp16", "float16", "half", "torch.float16"}
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_scaler)
         self.compile_failed = False
         self.compile_error: str | None = None
-        if bool(cfg.get("use_compile", False)) and device.type == "cuda" and hasattr(torch, "compile"):
-            try:
-                self.model = torch.compile(self.model, mode=cfg.get("compile_mode", "reduce-overhead"))
-            except Exception as exc:  # pragma: no cover - depends on local torch/compiler stack
-                self.compile_failed = True
-                self.compile_error = str(exc)
-                print(f"WARNING: torch.compile failed; continuing uncompiled: {exc}")
+        self.cfg["use_compile_effective"] = False
+        self.cfg["compile_failure_reason"] = None
+        self._maybe_compile(compile_warmup_x)
         self.opt = torch.optim.AdamW(self.original_model.parameters(), lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 0.0))
         self.sched = (
             torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=max(1, cfg["epochs"]))
             if cfg.get("cosine_schedule", True)
             else None
         )
-        self.use_amp = bool(cfg.get("use_amp", cfg.get("mixed_precision", False))) and device.type == "cuda"
-        self.amp_dtype = self._resolve_amp_dtype(cfg.get("amp_dtype", "bf16"))
-        self.use_scaler = self.use_amp and self.amp_dtype == torch.float16 and bool(cfg.get("use_grad_scaler", False))
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler)
+
+    def _maybe_compile(self, compile_warmup_x: torch.Tensor | None = None) -> None:
+        if not bool(self.cfg.get("use_compile", False)):
+            self.cfg["compile_failure_reason"] = None
+            return
+        if self.device.type != "cuda":
+            self.cfg["compile_failure_reason"] = "compile only enabled on cuda"
+            return
+        if not hasattr(torch, "compile"):
+            self.cfg["compile_failure_reason"] = "torch.compile unavailable"
+            return
+        try:
+            compiled = torch.compile(self.model, mode=self.cfg.get("compile_mode", "reduce-overhead"))
+            if compile_warmup_x is not None:
+                compiled.eval()
+                warmup_x = compile_warmup_x[:1].to(self.device, non_blocking=True)
+                with torch.no_grad(), self._amp_context():
+                    _ = compiled(warmup_x)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+            self.model = compiled
+            self.cfg["use_compile_effective"] = True
+            self.cfg["compile_failure_reason"] = None
+        except Exception as exc:  # pragma: no cover - depends on local torch/compiler stack
+            self.compile_failed = True
+            self.compile_error = str(exc)
+            self.model = self.original_model
+            self.cfg["use_compile_effective"] = False
+            self.cfg["compile_failure_reason"] = str(exc)
+            print(f"WARNING: torch.compile failed or warmup failed; continuing uncompiled: {exc}")
 
     @staticmethod
     def _resolve_amp_dtype(name: str | torch.dtype) -> torch.dtype:

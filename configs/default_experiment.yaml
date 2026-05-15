@@ -116,3 +116,9 @@ training:
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
+  model_compile_defaults:
+    unet3d: true
+    fno3d: false
+    sheaf_mhd: false
+    mlp: true
+    sheaf_equilibrium: false

@@ -27,6 +27,7 @@ from src.physics.divergence import periodic_divergence_3d
 from src.training.evaluator import evaluate
 from src.training.rollout import rollout_evaluate
 from src.training.trainer import Trainer
+from src.training.losses import mhd_loss
 from src.utils.config import load_yaml, save_json
 from src.utils.logging import setup_logger
 from src.utils.plotting import (
@@ -42,8 +43,8 @@ from src.utils.seed import seed_everything
 from src.utils.stats import aggregate_metrics, pairwise_comparisons
 from src.utils.tables import write_tables
 
-FAST_DEV_RUN = True
-FINAL_RUN = False
+FAST_DEV_RUN = False
+FINAL_RUN = True
 RUN_THE_WELL = True
 RUN_SWIGS = True
 RUN_CONSTELLARATION = True
@@ -234,6 +235,34 @@ def make_loaders(datasets: dict[str, Any], batch_size: int, loader_cfg: dict[str
     return {split: DataLoader(ds, shuffle=(split == "train"), **kwargs) for split, ds in datasets.items()}
 
 
+
+def resolve_compile_request(model_name: str, dcfg: dict[str, Any], training_cfg: dict[str, Any]) -> bool:
+    if "use_compile" in dcfg:
+        return bool(dcfg["use_compile"])
+    defaults = training_cfg.get("model_compile_defaults", {})
+    if model_name in defaults:
+        return bool(defaults[model_name])
+    return bool(training_cfg.get("use_compile", False))
+
+
+def build_run_cfg(dcfg: dict[str, Any], training_cfg: dict[str, Any], dataset_name: str, model_name: str, seed: int, lambda_div: float, batch_size_requested: int, batch_size_effective: int, cache_path: str | None) -> dict[str, Any]:
+    use_compile_requested = resolve_compile_request(model_name, dcfg, training_cfg)
+    run_cfg = {**dcfg, **training_cfg, "dataset": dataset_name, "model": model_name, "seed": seed, "lambda_div": lambda_div}
+    run_cfg.update({
+        "batch_size_requested": batch_size_requested,
+        "batch_size_effective": batch_size_effective,
+        "cache_path": cache_path,
+        "use_compile_requested": use_compile_requested,
+        "use_compile": use_compile_requested,
+        "use_compile_effective": False,
+        "compile_failure_reason": None,
+    })
+    return run_cfg
+
+
+def save_failed_run(run_dir: Path, err: dict[str, Any]) -> None:
+    save_json(err, run_dir / "failed_run.json")
+
 def is_cuda_oom(exc: BaseException) -> bool:
     return isinstance(exc, torch.cuda.OutOfMemoryError) or ("CUDA out of memory" in str(exc) or "cuda runtime error" in str(exc).lower() and "out of memory" in str(exc).lower())
 
@@ -241,7 +270,8 @@ def is_cuda_oom(exc: BaseException) -> bool:
 def log_run_start(logger, run_cfg: dict[str, Any]) -> None:
     fields = [
         "dataset", "model", "seed", "batch_size_requested", "batch_size_effective", "use_amp", "amp_dtype",
-        "use_compile", "compile_mode", "use_cache", "cache_path", "crop_size", "downsample_by",
+        "use_compile_requested", "use_compile_effective", "compile_mode", "compile_failure_reason",
+        "use_cache", "cache_path", "crop_size", "downsample_by",
         "num_workers", "pin_memory", "persistent_workers", "prefetch_factor",
     ]
     logger.info("Run configuration:\n%s", "\n".join(f"  {key}: {run_cfg.get(key)}" for key in fields))
@@ -256,18 +286,26 @@ def run_time_dependent_once(dataset_name: str, model_name: str, seed: int, dcfg:
         if device.type == "cuda":
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-        run_cfg = {**dcfg, **cfg.get("training", {}), "dataset": dataset_name, "model": model_name, "seed": seed, "lambda_div": dcfg.get("lambda_div", 0.0) if dcfg.get("magnetic_field_indices") else 0.0}
-        run_cfg.update({
-            "batch_size_requested": requested_bs,
-            "batch_size_effective": batch_size,
-            "cache_path": str(getattr(datasets["train"], "cache_dir", dcfg.get("cache_root", "datasets/cache"))),
-        })
+        lambda_div = dcfg.get("lambda_div", 0.0) if dcfg.get("magnetic_field_indices") else 0.0
+        run_cfg = build_run_cfg(
+            dcfg,
+            cfg.get("training", {}),
+            dataset_name,
+            model_name,
+            seed,
+            lambda_div,
+            requested_bs,
+            batch_size,
+            str(getattr(datasets["train"], "cache_dir", dcfg.get("cache_root", "datasets/cache"))),
+        )
         save_json(run_cfg, run_dir / "config_resolved.json")
-        log_run_start(logger, run_cfg)
         try:
             loaders = make_loaders(datasets, batch_size, loader_cfg, seed, device)
             model = build_time_model(model_name, in_ch, out_ch, dcfg)
-            trainer = Trainer(model, loaders["train"], loaders["valid"], run_dir, device, run_cfg)
+            warmup_batch = next(iter(loaders["train"]))
+            trainer = Trainer(model, loaders["train"], loaders["valid"], run_dir, device, run_cfg, compile_warmup_x=warmup_batch["x"])
+            save_json(run_cfg, run_dir / "config_resolved.json")
+            log_run_start(logger, run_cfg)
             rows = trainer.fit()
             model_for_eval = trainer.model
             amp_dtype = amp_dtype_from_cfg(run_cfg)
@@ -288,6 +326,110 @@ def run_time_dependent_once(dataset_name: str, model_name: str, seed: int, dcfg:
     assert last_exc is not None
     raise last_exc
 
+
+
+def validate_time_dataset_model_pairs(cfg: dict[str, Any], time_dataset_names: list[str], device: torch.device, logger) -> None:
+    """Run one forward/loss/evaluation batch per available time-dependent pair before FINAL_RUN."""
+    if not FINAL_RUN:
+        return
+    logger.info("Running FINAL_RUN startup validation before launching full seeds.")
+    validation_root = Path("outputs") / "startup_validation_tmp"
+    validation_root.mkdir(parents=True, exist_ok=True)
+    for dataset_name in time_dataset_names:
+        dcfg = dict(cfg["datasets"][dataset_name])
+        if not Path(dcfg["data_root"]).exists():
+            logger.warning("Skipping startup validation for missing dataset root: %s", dcfg["data_root"])
+            continue
+        datasets = {split: build_time_dataset(dataset_name, dcfg, split) for split in ("train", "valid", "test")}
+        if dataset_name == "swigs_gorgon":
+            train_ds = datasets["train"]
+            dcfg["magnetic_field_indices"] = dcfg.get("magnetic_field_indices") or getattr(train_ds, "magnetic_field_indices", None)
+        sample = datasets["train"][0]
+        in_ch = sample["x"].shape[0]
+        out_ch = sample["y"].shape[0]
+        loaders = make_loaders(datasets, 1, {**cfg.get("training", {}), "num_workers": 0, "persistent_workers": False}, 0, device)
+        batch = next(iter(loaders["train"]))
+        eval_loader = DataLoader(datasets["valid"], batch_size=1, shuffle=False, num_workers=0, collate_fn=sample_collate)
+        for model_name in cfg["time_dependent_models"]:
+            run_cfg = build_run_cfg(
+                dcfg,
+                cfg.get("training", {}),
+                dataset_name,
+                model_name,
+                0,
+                dcfg.get("lambda_div", 0.0) if dcfg.get("magnetic_field_indices") else 0.0,
+                1,
+                1,
+                str(getattr(datasets["train"], "cache_dir", dcfg.get("cache_root", "datasets/cache"))),
+            )
+            run_dir = validation_root / dataset_name / model_name
+            try:
+                model = build_time_model(model_name, in_ch, out_ch, dcfg)
+                trainer = Trainer(model, loaders["train"], loaders["valid"], run_dir, device, run_cfg, compile_warmup_x=batch["x"])
+                x = batch["x"].to(device)
+                y = batch["y"].to(device)
+                with torch.no_grad(), trainer._amp_context():
+                    pred = trainer.model(x)
+                    loss = mhd_loss(pred, y, run_cfg.get("lambda_rel", 0.1), run_cfg.get("lambda_div", 0.0), dcfg.get("magnetic_field_indices"), dcfg.get("spacing"))
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("startup validation produced NaN/Inf loss")
+                metrics = evaluate(trainer.model, eval_loader, device, dcfg.get("magnetic_field_indices"), dcfg.get("spacing"), include_spectral=True, use_amp=run_cfg.get("use_amp", False), amp_dtype=amp_dtype_from_cfg(run_cfg))
+                if pred.ndim == 5 and not torch.isfinite(torch.tensor(metrics.get("spectral_error_3d", float("nan")))):
+                    logger.warning("Startup validation spectral_error_3d is non-finite for %s/%s: %s", dataset_name, model_name, metrics.get("spectral_error_3d"))
+                logger.info("Startup validation passed for %s/%s compile_effective=%s", dataset_name, model_name, run_cfg.get("use_compile_effective"))
+            except Exception as exc:
+                err = {
+                    "dataset": dataset_name,
+                    "model": model_name,
+                    "seed": 0,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "resolved_config": run_cfg,
+                }
+                save_failed_run(run_dir, err)
+                logger.error("Startup validation failed: %s", err)
+                raise RuntimeError(f"Startup validation failed for {dataset_name}/{model_name}; stopping before FINAL_RUN") from exc
+
+    if RUN_CONSTELLARATION:
+        dataset_name = "constellaration_equilibrium"
+        dcfg = dict(cfg["datasets"][dataset_name])
+        if not Path(dcfg["data_root"]).exists():
+            logger.warning("Skipping startup validation for missing optional dataset root: %s", dcfg["data_root"])
+            return
+        datasets = {split: build_equilibrium_dataset(dcfg, split) for split in ("train", "valid", "test")}
+        sample = datasets["train"][0]
+        in_dim = sample["x"].numel()
+        out_dim = sample["y"].numel()
+        loaders = make_loaders(datasets, 1, {**cfg.get("training", {}), "num_workers": 0, "persistent_workers": False}, 0, device)
+        batch = next(iter(loaders["train"]))
+        eval_loader = DataLoader(datasets["valid"], batch_size=1, shuffle=False, num_workers=0, collate_fn=sample_collate)
+        for model_name in cfg["equilibrium_models"]:
+            run_cfg = build_run_cfg(dcfg, cfg.get("training", {}), dataset_name, model_name, 0, 0.0, 1, 1, None)
+            run_dir = validation_root / dataset_name / model_name
+            try:
+                model = build_equilibrium_model(model_name, in_dim, out_dim, dcfg)
+                trainer = Trainer(model, loaders["train"], loaders["valid"], run_dir, device, run_cfg, compile_warmup_x=batch["x"])
+                x = batch["x"].to(device)
+                y = batch["y"].to(device)
+                with torch.no_grad(), trainer._amp_context():
+                    pred = trainer.model(x)
+                    loss = mhd_loss(pred, y, run_cfg.get("lambda_rel", 0.1), 0.0, None, None)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("startup validation produced NaN/Inf loss")
+                evaluate(trainer.model, eval_loader, device, None, None, include_spectral=False, use_amp=run_cfg.get("use_amp", False), amp_dtype=amp_dtype_from_cfg(run_cfg))
+                logger.info("Startup validation passed for %s/%s compile_effective=%s", dataset_name, model_name, run_cfg.get("use_compile_effective"))
+            except Exception as exc:
+                err = {
+                    "dataset": dataset_name,
+                    "model": model_name,
+                    "seed": 0,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "resolved_config": run_cfg,
+                }
+                save_failed_run(run_dir, err)
+                logger.error("Startup validation failed: %s", err)
+                raise RuntimeError(f"Startup validation failed for {dataset_name}/{model_name}; stopping before FINAL_RUN") from exc
 
 def main() -> None:
     start_suite = time.perf_counter()
@@ -317,6 +459,8 @@ def main() -> None:
         time_dataset_names.append("wells_mhd64")
     if RUN_SWIGS:
         time_dataset_names.append("swigs_gorgon")
+
+    validate_time_dataset_model_pairs(cfg, time_dataset_names, device, logger)
 
     for dataset_name in time_dataset_names:
         dcfg = dict(cfg["datasets"][dataset_name])
@@ -370,8 +514,9 @@ def main() -> None:
                     completed += 1
                     logger.info("Completed %s/%s seed %s", dataset_name, model_name, seed)
                 except Exception as exc:
-                    err = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "time_dependent", "status": "failed", "error": str(exc), "traceback": traceback.format_exc()}
-                    save_json(err, run_dir / "failure.json")
+                    resolved_config = json.loads((run_dir / "config_resolved.json").read_text(encoding="utf-8")) if (run_dir / "config_resolved.json").exists() else {}
+                    err = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "time_dependent", "status": "failed", "error": str(exc), "traceback": traceback.format_exc(), "resolved_config": resolved_config}
+                    save_failed_run(run_dir, err)
                     raw_rows.append(err); failures.append(err)
                     logger.error("Run failed: %s", err)
 
@@ -397,8 +542,8 @@ def main() -> None:
                         seed_everything(seed)
                         run_dir = out_root / "runs" / dataset_name / model_name / f"seed_{seed}"
                         run_dir.mkdir(parents=True, exist_ok=True); (run_dir / "figures").mkdir(exist_ok=True)
-                        run_cfg = {**dcfg, **cfg.get("training", {}), "dataset": dataset_name, "model": model_name, "seed": seed, "lambda_div": 0.0, "batch_size_requested": dcfg["batch_size"], "batch_size_effective": dcfg["batch_size"], "cache_path": None}
-                        save_json(run_cfg, run_dir / "config_resolved.json"); log_run_start(logger, run_cfg)
+                        run_cfg = build_run_cfg(dcfg, cfg.get("training", {}), dataset_name, model_name, seed, 0.0, dcfg["batch_size"], dcfg["batch_size"], None)
+                        save_json(run_cfg, run_dir / "config_resolved.json")
                         try:
                             requested_bs = int(dcfg["batch_size"])
                             batch_size = requested_bs
@@ -408,7 +553,10 @@ def main() -> None:
                                     run_cfg["batch_size_effective"] = batch_size
                                     save_json(run_cfg, run_dir / "config_resolved.json")
                                     loaders = make_loaders(datasets, batch_size, {**cfg.get("training", {}), **dcfg.get("dataloader", {})}, seed, device)
-                                    trainer = Trainer(build_equilibrium_model(model_name, in_dim, out_dim, dcfg), loaders["train"], loaders["valid"], run_dir, device, run_cfg)
+                                    warmup_batch = next(iter(loaders["train"]))
+                                    trainer = Trainer(build_equilibrium_model(model_name, in_dim, out_dim, dcfg), loaders["train"], loaders["valid"], run_dir, device, run_cfg, compile_warmup_x=warmup_batch["x"])
+                                    save_json(run_cfg, run_dir / "config_resolved.json")
+                                    log_run_start(logger, run_cfg)
                                     rows = trainer.fit(); model_for_eval = trainer.model
                                     test_metrics = evaluate(model_for_eval, loaders["test"], device, None, None, include_spectral=False, use_amp=run_cfg.get("use_amp", False), amp_dtype=amp_dtype_from_cfg(run_cfg))
                                     break
@@ -426,8 +574,9 @@ def main() -> None:
                             epoch_times.setdefault(f"{dataset_name}/{model_name}", []).extend(float(r.get("total_epoch_time", 0.0)) for r in rows)
                             completed += 1
                         except Exception as exc:
-                            err = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "equilibrium", "status": "failed", "error": str(exc), "traceback": traceback.format_exc()}
-                            save_json(err, run_dir / "failure.json"); raw_rows.append(err); failures.append(err); logger.error("Run failed: %s", err)
+                            resolved_config = json.loads((run_dir / "config_resolved.json").read_text(encoding="utf-8")) if (run_dir / "config_resolved.json").exists() else {}
+                            err = {"dataset": dataset_name, "model": model_name, "seed": seed, "track": "equilibrium", "status": "failed", "error": str(exc), "traceback": traceback.format_exc(), "resolved_config": resolved_config}
+                            save_failed_run(run_dir, err); raw_rows.append(err); failures.append(err); logger.error("Run failed: %s", err)
 
     save_json(dataset_inspection, out_root / "dataset_inspection.json")
     raw = pd.DataFrame(raw_rows)

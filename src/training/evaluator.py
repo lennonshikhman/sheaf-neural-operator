@@ -50,7 +50,8 @@ def evaluate(model, loader, device, magnetic_field_indices=None, spacing=None, i
             div.append(float(magnetic_divergence_l2(pred, magnetic_field_indices, spacing or [1.0] * (pred.ndim - 2)).detach().cpu()))
             divr.append(float(magnetic_divergence_relative(pred, magnetic_field_indices, spacing or [1.0] * (pred.ndim - 2)).detach().cpu()))
             if include_spectral and pred.ndim == 5:
-                spec.append(float(spectral_error(pred, y).detach().cpu()))
+                with torch.autocast(device_type=device.type, enabled=False):
+                    spec.append(float(spectral_error(pred.float(), y.float()).detach().cpu()))
     import numpy as np
 
     return {
