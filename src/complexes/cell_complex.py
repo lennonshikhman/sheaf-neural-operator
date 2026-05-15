@@ -72,7 +72,7 @@ class CellComplex:
             return 0.0
         left = self.coboundary[k + 1].detach().to(device="cpu", dtype=torch.float32).coalesce()
         right = self.coboundary[k].detach().to(device="cpu", dtype=torch.float32).coalesce()
-        with warnings.catch_warnings():
+        with warnings.catch_warnings(), torch.amp.autocast(device_type="cpu", enabled=False):
             warnings.filterwarnings("ignore", message="Sparse CSR tensor support is in beta state.*")
             prod = torch.sparse.mm(left, right).coalesce()
         if prod._nnz() == 0:

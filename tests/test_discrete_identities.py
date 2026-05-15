@@ -23,3 +23,23 @@ def test_sparse_identity_check_and_sparse_mm_tolerate_bfloat16():
     curl = sparse_mm(cx.d(1), e)
     assert curl.dtype == torch.bfloat16
     assert curl.shape == (1, cx.num_cells(2), 1)
+
+
+def test_sparse_mm_disables_autocast_for_bfloat16():
+    cx = cubical_complex_3d(4, 4, 4, periodic=False)
+    e = torch.randn(1, cx.num_cells(1), 1)
+    with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
+        curl = sparse_mm(cx.d(1), e)
+    assert curl.dtype == e.dtype
+    assert curl.shape == (1, cx.num_cells(2), 1)
+
+
+def test_sparse_mm_disables_cuda_autocast_for_bfloat16_if_available():
+    if not torch.cuda.is_available():
+        return
+    cx = cubical_complex_3d(4, 4, 4, periodic=False).to("cuda", torch.float32)
+    e = torch.randn(1, cx.num_cells(1), 1, device="cuda", dtype=torch.bfloat16)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        curl = sparse_mm(cx.d(1), e)
+    assert curl.dtype == torch.bfloat16
+    assert curl.shape == (1, cx.num_cells(2), 1)
