@@ -1,12 +1,12 @@
-# Sheaf Neural Operators for Structure-Preserving Magnetohydrodynamic Surrogate Modeling
+# Cellular Sheaf Neural Operators for Structure-Preserving Magnetohydrodynamic Surrogate Modeling
 
-This repository implements a one-command experimental suite for comparing standard neural PDE surrogate models against a **Sheaf Neural Operator** for magnetohydrodynamic (MHD) surrogate modeling.
+This repository implements a one-command experimental suite for comparing standard neural PDE surrogate models against a **Cellular Sheaf Neural Operator** for magnetohydrodynamic (MHD) surrogate modeling.
 
-The central scientific claim is not that the current datasets are already arbitrary unstructured cell complexes. Instead, the claim is that MHD fields have different physical roles, constraints, and compatibility relations. The Sheaf Neural Operator represents these coupled variables through local fibers, learned restriction maps, and incidence/Hodge-inspired communication features rather than treating every field as an interchangeable image channel.
+The central scientific claim is not that the current datasets are already arbitrary unstructured cell complexes. Instead, the claim is that MHD fields have different physical roles, constraints, and compatibility relations. The Cellular Sheaf Neural Operator represents these coupled variables through local fibers, learned restriction maps, and incidence/Hodge-inspired communication features rather than treating every field as an interchangeable image channel.
 
-## Why Sheaf Neural Operators for MHD?
+## Why Cellular Sheaf Neural Operators for MHD?
 
-MHD couples density, pressure, velocity, magnetic fields, current density, and boundary/interface effects. A Sheaf Neural Operator is appropriate because it can:
+MHD couples density, pressure, velocity, magnetic fields, current density, and boundary/interface effects. A Cellular Sheaf Neural Operator is appropriate because it can:
 
 - maintain separate local fibers for fluid and magnetic variables;
 - learn restriction/coupling maps between those fibers;
@@ -15,7 +15,7 @@ MHD couples density, pressure, velocity, magnetic fields, current density, and b
 - provide ablations with or without restriction maps and incidence features;
 - support both homogeneous turbulence-style benchmarks and bounded/coupled MHD systems.
 
-The paper-facing model name is **Sheaf Neural Operator**. The internal model key is `sheaf_mhd`, implemented by `SheafMHDOperator`.
+The paper-facing model name is **Cellular Sheaf Neural Operator**. The internal model key is `sheaf_mhd`, implemented by `SheafMHDOperator`.
 
 ## Datasets
 
@@ -93,7 +93,7 @@ Time-dependent models:
 
 - `unet3d`
 - `fno3d`
-- `sheaf_mhd` / **Sheaf Neural Operator**
+- `sheaf_mhd` / **Cellular Sheaf Neural Operator**
 
 Optional equilibrium dataset:
 
