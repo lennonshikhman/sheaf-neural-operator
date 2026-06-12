@@ -269,3 +269,19 @@ Natural extensions include:
 - longer rollout horizons;
 - additional constrained PDE systems beyond MHD;
 - integration with conservative, compatible, or finite-element-style surrogate-modeling pipelines.
+
+## Citation
+
+If you use this repository in academic work, please cite the arXiv/SSRN preprint:
+
+```bibtex
+@misc{shikhman2026csno,
+      title={Cellular Sheaf Neural Operators for Structure-Preserving Surrogate Modeling of Constrained PDEs}, 
+      author={Lennon J. Shikhman and Shane Gilbertie},
+      year={2026},
+      eprint={2606.00937},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2606.00937}, 
+}
+```
